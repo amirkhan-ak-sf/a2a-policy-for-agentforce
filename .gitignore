@@ -1,0 +1,55 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+.idea-definition.md
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# electron desktop build outputs
+/dist-electron/
+/release/
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# local env files
+.env*.local
+.env
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+#supabase
+supabase/.branches/
+supabase/.temp/
+supabase/backup/
+
+# Local Supabase development
+.local/
+.env.supabase
+.supabase-projects.json
+
+# Production data dumps (NEVER commit!)
+*-data.sql
+*-prod-data.sql
+*-production-dump.sql
+prod-dump-*.sql
+scripts/seed-production.sql
