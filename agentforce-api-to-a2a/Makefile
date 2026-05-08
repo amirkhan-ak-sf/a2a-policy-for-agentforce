@@ -91,6 +91,13 @@ build-asset-files: $(DEFINITION_SRC_GCL_PATH)
 		cp definition/target/definition/exchange.json definition/target/exchange.json 2>/dev/null || true; \
 		cp definition/target/definition/schema.json   definition/target/schema.json   2>/dev/null || true; \
 	fi
+	@if [ -f definition/target/gcl.yaml ] && [ ! -f definition/target/definition/gcl.yaml ]; then \
+		mkdir -p definition/target/definition; \
+		cp definition/target/gcl.yaml      definition/target/definition/gcl.yaml      2>/dev/null || true; \
+		cp definition/target/metadata.yaml definition/target/definition/metadata.yaml 2>/dev/null || true; \
+		cp definition/target/exchange.json definition/target/definition/exchange.json 2>/dev/null || true; \
+		cp definition/target/schema.json   definition/target/definition/schema.json   2>/dev/null || true; \
+	fi
 	@cargo anypoint config-gen -p -m $(DEFINITION_SRC_GCL_PATH) -o src/generated/config.rs
 
 .PHONY: login

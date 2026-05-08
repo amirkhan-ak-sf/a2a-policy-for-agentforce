@@ -134,6 +134,13 @@ pub struct AgentforceMessage {
 pub struct AgentforceClient {
     auth: Rc<AgentforceAuth>,
     api: Rc<Service>,
+    /// Base path extracted from `agentforceApiUrl` at policy load time
+    /// (e.g. `/einstein/ai-agent/v1` for `https://api.salesforce.com/einstein/ai-agent/v1`).
+    /// PDK's `RequestBuilder::path` *replaces* the registered Service URI's path
+    /// instead of appending to it (see pdk-classy `client.rs:310`), so we have
+    /// to prepend this manually on every outbound call. Empty when the
+    /// configured URL is host-only.
+    api_base_path: String,
     /// Public Salesforce my-domain URL used as `instanceConfig.endpoint`
     /// in start-session calls. Not the same as the OAuth Service - this
     /// value is passed by reference to Agentforce, not used to dispatch.
@@ -146,6 +153,7 @@ impl AgentforceClient {
     pub fn new(
         auth: Rc<AgentforceAuth>,
         api: Rc<Service>,
+        api_base_path: String,
         my_domain_url_value: String,
         agent_id: String,
         bypass_user: bool,
@@ -153,9 +161,27 @@ impl AgentforceClient {
         Self {
             auth,
             api,
+            api_base_path: normalize_base_path(&api_base_path),
             my_domain_url_value,
             agent_id,
             bypass_user,
+        }
+    }
+
+    /// Compose the full request path by joining the configured API base path
+    /// (typically `/einstein/ai-agent/v1`) with the per-call relative path
+    /// (e.g. `/agents/{id}/sessions`). Always produces a leading `/` and
+    /// avoids `//` at the seam.
+    fn full_path(&self, rel: &str) -> String {
+        let rel_norm = if rel.starts_with('/') {
+            rel.to_string()
+        } else {
+            format!("/{rel}")
+        };
+        if self.api_base_path.is_empty() {
+            rel_norm
+        } else {
+            format!("{}{}", self.api_base_path, rel_norm)
         }
     }
 
@@ -176,7 +202,10 @@ impl AgentforceClient {
         };
         let body =
             serde_json::to_vec(&body_struct).map_err(|e| ClientError::BadJson(e.to_string()))?;
-        let path = format!("/agents/{}/sessions", urlencoding::encode(&self.agent_id));
+        let path = self.full_path(&format!(
+            "/agents/{}/sessions",
+            urlencoding::encode(&self.agent_id)
+        ));
 
         // First attempt with the proactively-fresh token.
         let token = self.auth.get_token(client, now_unix, false).await?;
@@ -257,7 +286,10 @@ impl AgentforceClient {
         };
         let body =
             serde_json::to_vec(&body_struct).map_err(|e| ClientError::BadJson(e.to_string()))?;
-        let path = format!("/sessions/{}/messages", urlencoding::encode(session_id));
+        let path = self.full_path(&format!(
+            "/sessions/{}/messages",
+            urlencoding::encode(session_id)
+        ));
 
         let token = self.auth.get_token(client, now_unix, false).await?;
         match self.post_send_message(client, &path, &body, &token).await {
@@ -323,7 +355,7 @@ impl AgentforceClient {
         session_id: &str,
         now_unix: u64,
     ) -> Result<(), ClientError> {
-        let path = format!("/sessions/{}", urlencoding::encode(session_id));
+        let path = self.full_path(&format!("/sessions/{}", urlencoding::encode(session_id)));
 
         let token = self.auth.get_token(client, now_unix, false).await?;
         match self.delete_session(client, &path, &token).await {
@@ -375,6 +407,23 @@ impl AgentforceClient {
         }
         Ok(())
     }
+}
+
+/// Normalize a base path so it has a single leading `/` and no trailing `/`.
+/// Empty string in -> empty string out (signals "no prefix").
+pub(crate) fn normalize_base_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        return String::new();
+    }
+    let mut s = trimmed.to_string();
+    if !s.starts_with('/') {
+        s.insert(0, '/');
+    }
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    s
 }
 
 /// Trim very long upstream error bodies for log/error surfaces. Keeps the
@@ -429,6 +478,19 @@ mod tests {
         assert_eq!(json["message"]["type"], "Text");
         assert_eq!(json["message"]["sequenceId"], 7);
         assert_eq!(json["message"]["text"], "hi");
+    }
+
+    #[test]
+    fn normalize_base_path_handles_common_inputs() {
+        assert_eq!(normalize_base_path(""), "");
+        assert_eq!(normalize_base_path("/"), "");
+        assert_eq!(normalize_base_path("/einstein/ai-agent/v1"), "/einstein/ai-agent/v1");
+        assert_eq!(
+            normalize_base_path("/einstein/ai-agent/v1/"),
+            "/einstein/ai-agent/v1"
+        );
+        assert_eq!(normalize_base_path("einstein/ai-agent/v1"), "/einstein/ai-agent/v1");
+        assert_eq!(normalize_base_path("  /v1  "), "/v1");
     }
 
     #[test]

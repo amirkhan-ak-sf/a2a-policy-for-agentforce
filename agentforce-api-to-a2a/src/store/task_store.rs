@@ -102,17 +102,26 @@ impl TaskStore {
         now_unix: u64,
     ) -> Option<Vec<u8>> {
         let key = Self::task_key(task_id);
+        logger::error!("a2a-trace: task-store get_task key='{key}'");
         if let Some(b) = self.read_hot(&key, now_unix) {
-            logger::debug!("task-store: hot hit for {task_id}");
+            logger::error!("a2a-trace: task-store hot hit for {task_id}");
             return Some(b);
         }
+        logger::error!("a2a-trace: task-store calling os2.get");
         match self.os2.get(client, &key, now_unix).await {
             GetOutcome::Found(bytes) => {
+                logger::error!("a2a-trace: task-store os2 found, len={}", bytes.len());
                 self.write_hot(&key, &bytes, now_unix);
                 Some(bytes)
             }
-            GetOutcome::NotFound => None,
-            GetOutcome::Degraded => None,
+            GetOutcome::NotFound => {
+                logger::error!("a2a-trace: task-store os2 not found");
+                None
+            }
+            GetOutcome::Degraded => {
+                logger::error!("a2a-trace: task-store os2 degraded");
+                None
+            }
         }
     }
 

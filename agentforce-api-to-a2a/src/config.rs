@@ -58,6 +58,11 @@ pub enum ConfigError {
     #[error("agentCardJson must be a JSON object")]
     AgentCardJsonNotObject,
 
+    #[error(
+        "agentCardProviderOrganization and agentCardProviderUrl must be set together (A2A 0.3.0 §5.5 requires AgentProvider.organization and AgentProvider.url) — leave both blank to omit the provider block"
+    )]
+    AgentCardProviderHalfSet,
+
     #[error("invalid JSON in {field}: {error}")]
     InvalidJson { field: &'static str, error: String },
 }
@@ -144,6 +149,9 @@ pub struct PolicyConfig {
     pub anypoint_org_id: String,
     pub anypoint_env_id: String,
     pub object_store_id: String,
+    pub auto_create_store: bool,
+    pub disable_object_store: bool,
+    pub object_store_ttl_seconds: u32,
     pub task_hot_cache_ttl_seconds: u32,
     pub task_store_timeout_ms: u64,
 
@@ -176,6 +184,9 @@ pub struct RawConfig {
     pub anypoint_org_id: Option<String>,
     pub anypoint_env_id: Option<String>,
     pub object_store_id: Option<String>,
+    pub auto_create_store: Option<bool>,
+    pub disable_object_store: Option<bool>,
+    pub object_store_ttl_seconds: Option<i64>,
     pub task_hot_cache_ttl_seconds: Option<i64>,
     pub task_store_timeout_ms: Option<i64>,
 
@@ -221,6 +232,10 @@ impl PolicyConfig {
             nonempty(raw.anypoint_env_id.clone(), ConfigError::MissingAnypointEnvId)?;
         let object_store_id =
             nonempty(raw.object_store_id.clone(), ConfigError::MissingObjectStoreId)?;
+        let auto_create_store = raw.auto_create_store.unwrap_or(true);
+        let disable_object_store = raw.disable_object_store.unwrap_or(false);
+        let object_store_ttl_seconds =
+            clamp_u32(raw.object_store_ttl_seconds, 60, 2_592_000, 86_400);
 
         let protocol_version =
             ProtocolVersion::parse(raw.protocol_version.as_deref().unwrap_or("0.3.0"))?;
@@ -288,6 +303,9 @@ impl PolicyConfig {
             anypoint_org_id,
             anypoint_env_id,
             object_store_id,
+            auto_create_store,
+            disable_object_store,
+            object_store_ttl_seconds,
             task_hot_cache_ttl_seconds,
             task_store_timeout_ms,
 
@@ -321,14 +339,20 @@ fn parse_structured(raw: &RawConfig) -> Result<StructuredCardConfig, ConfigError
         ConfigError::AgentCardSecuritySchemesNotObject,
     )?;
 
+    let provider_organization = nonempty_opt(raw.agent_card_provider_organization.clone());
+    let provider_url = nonempty_opt(raw.agent_card_provider_url.clone());
+    if provider_organization.is_some() != provider_url.is_some() {
+        return Err(ConfigError::AgentCardProviderHalfSet);
+    }
+
     Ok(StructuredCardConfig {
         name: nonempty_opt(raw.agent_card_name.clone()),
         description: nonempty_opt(raw.agent_card_description.clone()),
         version: nonempty_opt(raw.agent_card_version.clone()),
         icon_url: nonempty_opt(raw.agent_card_icon_url.clone()),
         documentation_url: nonempty_opt(raw.agent_card_documentation_url.clone()),
-        provider_organization: nonempty_opt(raw.agent_card_provider_organization.clone()),
-        provider_url: nonempty_opt(raw.agent_card_provider_url.clone()),
+        provider_organization,
+        provider_url,
         capabilities_streaming: raw.agent_card_capabilities_streaming.unwrap_or(false),
         capabilities_push_notifications: raw
             .agent_card_capabilities_push_notifications
@@ -552,6 +576,41 @@ mod tests {
             vec!["text/plain".to_string(), "application/json".to_string()]
         );
         assert!(cfg.structured_card.skills.is_array());
+    }
+
+    #[test]
+    fn provider_org_without_url_is_rejected() {
+        let mut raw = minimal();
+        raw.agent_card_provider_organization = Some("Acme".into());
+        raw.agent_card_provider_url = None;
+        assert!(matches!(
+            PolicyConfig::from_raw(raw),
+            Err(ConfigError::AgentCardProviderHalfSet)
+        ));
+    }
+
+    #[test]
+    fn provider_url_without_org_is_rejected() {
+        let mut raw = minimal();
+        raw.agent_card_provider_organization = None;
+        raw.agent_card_provider_url = Some("https://acme.example.com".into());
+        assert!(matches!(
+            PolicyConfig::from_raw(raw),
+            Err(ConfigError::AgentCardProviderHalfSet)
+        ));
+    }
+
+    #[test]
+    fn provider_both_or_neither_is_accepted() {
+        let mut raw = minimal();
+        raw.agent_card_provider_organization = Some("Acme".into());
+        raw.agent_card_provider_url = Some("https://acme.example.com".into());
+        assert!(PolicyConfig::from_raw(raw.clone()).is_ok());
+
+        let mut raw = minimal();
+        raw.agent_card_provider_organization = None;
+        raw.agent_card_provider_url = None;
+        assert!(PolicyConfig::from_raw(raw).is_ok());
     }
 
     #[test]

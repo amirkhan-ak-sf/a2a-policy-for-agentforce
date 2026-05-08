@@ -114,7 +114,7 @@ impl From<&Config> for RawConfig {
             bypass_user: c.bypass_user,
             cache_safety_margin_seconds: c.cache_safety_margin_seconds,
             protocol_version: c.protocol_version.clone(),
-            a2a_rpc_path: c.a2a_rpc_path.clone(),
+            a2a_rpc_path: c.a_2_a_rpc_path.clone(),
             public_base_url: Some(c.public_base_url.clone()),
             strict_mode: c.strict_mode,
             anypoint_client_id: Some(c.anypoint_client_id.clone()),
@@ -122,6 +122,9 @@ impl From<&Config> for RawConfig {
             anypoint_org_id: Some(c.anypoint_org_id.clone()),
             anypoint_env_id: Some(c.anypoint_env_id.clone()),
             object_store_id: Some(c.object_store_id.clone()),
+            auto_create_store: c.auto_create_store,
+            disable_object_store: c.disable_object_store,
+            object_store_ttl_seconds: c.object_store_ttl_seconds,
             task_hot_cache_ttl_seconds: c.task_hot_cache_ttl_seconds,
             task_store_timeout_ms: c.task_store_timeout_ms,
             agent_card_source: c.agent_card_source.clone(),
@@ -160,6 +163,13 @@ async fn request_filter(
     let method = request.method();
     let path = request.path();
     let route = classify(&method, &path, &state.cfg.a2a_rpc_path);
+    logger::debug!(
+        "a2a: classify method='{}' path='{}' a2a_rpc_path='{}' -> {:?}",
+        method,
+        path,
+        state.cfg.a2a_rpc_path,
+        route
+    );
 
     match route {
         Route::AgentCard => match state.card.bytes(&client, now_unix()).await {
@@ -191,30 +201,38 @@ async fn handle_rpc(
     state: PolicyState,
     client: HttpClient,
 ) -> Flow<()> {
+    logger::error!("a2a-trace: handle_rpc enter");
     if !request.contains_body() {
+        logger::error!("a2a-trace: handle_rpc no body");
         let err = JsonRpcError::new(None, INVALID_REQUEST, "Invalid Request: empty body");
         return Flow::Break(make_json_response(200, err.into_bytes().as_slice()));
     }
 
+    logger::error!("a2a-trace: handle_rpc reading body");
     let body_state = request.into_body_state().await;
     let body = body_state.handler().body();
+    logger::error!("a2a-trace: handle_rpc body read, len={}", body.len());
 
     let parsed = match jsonrpc::parse_request(&body) {
         Ok(r) => r,
         Err(err) => {
+            logger::error!("a2a-trace: handle_rpc parse failed");
             return Flow::Break(make_json_response(200, err.into_bytes().as_slice()));
         }
     };
+    logger::error!("a2a-trace: handle_rpc parsed method='{}'", parsed.method);
 
     let result = state
         .dispatcher
         .dispatch(&client, parsed, now_unix(), now_iso())
         .await;
+    logger::error!("a2a-trace: handle_rpc dispatch returned");
 
     let bytes = match result {
         Ok(success) => success.into_bytes(),
         Err(err) => err.into_bytes(),
     };
+    logger::error!("a2a-trace: handle_rpc emitting response, len={}", bytes.len());
     Flow::Break(make_json_response(200, &bytes))
 }
 
@@ -255,6 +273,18 @@ pub async fn configure(
     let my_domain_url_value = format!("{my_domain_scheme}://{my_domain_authority}");
     let anypoint_token_authority = anypoint_token_service.uri().authority().to_string();
 
+    // PDK's RequestBuilder::path() *replaces* the registered Service URI's
+    // path; it does not append. So if the operator configured
+    // `agentforceApiUrl: https://api.salesforce.com/einstein/ai-agent/v1`,
+    // a `.path("/agents/.../sessions")` outbound call would land at
+    // `https://api.salesforce.com/agents/.../sessions` and 404. We capture
+    // the base path here and prepend it inside AgentforceClient.
+    let agentforce_api_base_path = agentforce_api_service.uri().path().to_string();
+    logger::info!(
+        "agentforce-client: api base path = '{}'",
+        agentforce_api_base_path
+    );
+
     // Salesforce/Agentforce auth.
     let auth = Rc::new(AgentforceAuth::new(
         AgentforceAuthConfig {
@@ -271,6 +301,7 @@ pub async fn configure(
     let agentforce_client = Rc::new(AgentforceClient::new(
         auth.clone(),
         agentforce_api_service.clone(),
+        agentforce_api_base_path,
         my_domain_url_value,
         cfg.agent_id.clone(),
         cfg.bypass_user,
@@ -287,6 +318,9 @@ pub async fn configure(
             anypoint_token_url_for_cache_key: anypoint_token_authority.clone(),
             cache_safety_margin_seconds: cfg.cache_safety_margin_seconds,
             timeout_ms: cfg.task_store_timeout_ms,
+            auto_create_store: cfg.auto_create_store,
+            disable_object_store: cfg.disable_object_store,
+            object_store_ttl_seconds: cfg.object_store_ttl_seconds,
         },
         cache.clone(),
         anypoint_token_service.clone(),

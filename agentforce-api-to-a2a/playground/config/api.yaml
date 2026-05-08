@@ -18,49 +18,52 @@ spec:
             destinationPath: /anything/echo/
   policies:
     - policyRef:
-        name: agentforce-api-to-a2a-flex-v1-0 # overridden by `make run`
+        name: agentforce-api-to-a-2-a-v1-0-impl # overridden by `make run`
+        namespace: default
       # Replace the dummies with real values before deploying. The
       # `make run` target overrides only the policyRef.name; everything else
       # comes from this file.
       config:
-        myDomainUrl: https://acme.my.salesforce.com
+        myDomainUrl: https://storm-7b591fd6a36b2a.my.salesforce.com
         agentforceApiUrl: https://api.salesforce.com/einstein/ai-agent/v1
-        consumerKey: REPLACE_ME_CONSUMER_KEY
-        consumerSecret: REPLACE_ME_CONSUMER_SECRET
-        agentId: 0XXxx00000000000000
+        consumerKey: 3MVG9HB6vm3GZZR85KUaAZMhWxBT4ZyoijT31.4iCgOgR.1DTfqVSMv3Hq4vWXhUEjAiuOaSl0hKX7M4QXhAQ
+        consumerSecret: B050E64A1B96572AD4E2B8B886E310B5DB3B575C2B40E3D46142123B2306EEA2
+        agentId: 0XxHs000000viExKAI
         bypassUser: true
         cacheSafetyMarginSeconds: 60
 
         protocolVersion: "0.3.0"
-        a2aRpcPath: "/"
-        publicBaseUrl: http://localhost:8081/agentforce
-        strictMode: false
+        a2aRpcPath: "/a2a/v1/rpc"
+        publicBaseUrl: http://localhost:8081
+        strictMode: true
 
         objectStoreBaseUrl: https://object-store-us-east-1.anypoint.mulesoft.com
         anypointTokenUrl: https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token
-        anypointClientId: REPLACE_ME_ANYPOINT_CLIENT_ID
-        anypointClientSecret: REPLACE_ME_ANYPOINT_CLIENT_SECRET
-        anypointOrgId: 00000000-0000-0000-0000-000000000000
-        anypointEnvId: 00000000-0000-0000-0000-000000000000
-        objectStoreId: a2a-tasks
+        anypointClientId: 0ced7c22c8da494c9f0b51f799f22e1f
+        anypointClientSecret: 08834EE58C7746a5aEae17A99ff60587
+        anypointOrgId: f684513f-280e-403a-ac53-80ca62e3de49
+        anypointEnvId: 8c937036-f4d8-4405-a203-dd1e2b440ead
+        objectStoreId: agentforce-a2a-tasks
+        autoCreateStore: true
+        disableObjectStore: true
+        objectStoreTtlSeconds: 86400
         taskHotCacheTtlSeconds: 60
         taskStoreTimeoutMs: 1500
 
         agentCardSource: structured
-        agentCardName: Acme Agentforce Agent
-        agentCardDescription: A2A wrapper around the Agentforce Agents API.
+        agentCardName: Sales and Distribution Agent
+        agentCardDescription: Sales and Distribution Agent
         agentCardVersion: "1.0.0"
-        agentCardProviderOrganization: Acme, Inc.
+        agentCardIconUrl: https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSC_QFbTFMasUfnuKan4pWGlVr4700Fo7_9-w&s
+        agentCardProviderOrganization: Agentforce
+        agentCardProviderUrl: https://www.salesforce.com
         agentCardCapabilitiesStreaming: false
         agentCardCapabilitiesPushNotifications: false
         agentCardDefaultInputModes: text/plain
         agentCardDefaultOutputModes: text/plain
         agentCardSkillsJson: |
           [
-            {
-              "id": "general-conversation",
-              "name": "General Conversation",
-              "description": "Have a sync conversation with the Agentforce agent over A2A.",
-              "tags": ["agentforce","general"]
-            }
+            {"id":"inventory-check","name":"Inventory check","description":"Ask about MULETEST product availability","tags":["agentforce","inventory"]},
+            {"id":"order-submission","name":"Order submission","description":"Submit and process new customer orders","tags":["agentforce","order"]},
+            {"id":"process-delivery","name":"Process delivery","description":"Manage, schedule, and track product deliveries","tags":["agentforce","delivery"]}
           ]

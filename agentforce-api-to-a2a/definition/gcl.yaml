@@ -133,9 +133,39 @@ spec:
     objectStoreId:
       type: string
       description: |
-        Name of the Anypoint Object Store v2 store. The store must be
-        pre-created in Anypoint with the desired TTL and storage class;
-        the policy only reads/writes keys.
+        Name of the Anypoint Object Store v2 store. If autoCreateStore is
+        true (the default) and the store does not exist, the policy will
+        create it on the first persistence call using objectStoreTtlSeconds.
+        The connected app supplied via anypointClientId must have admin
+        access to OS v2 in that case. If autoCreateStore is false, the
+        store must already exist.
+    autoCreateStore:
+      type: boolean
+      default: true
+      description: |
+        When true, the policy creates the OS v2 store on first use if it
+        does not yet exist. The connected app must have OS v2 admin access.
+        Set to false to require operators to pre-create the store via
+        Runtime Manager or the Anypoint CLI.
+    disableObjectStore:
+      type: boolean
+      default: false
+      description: |
+        When true, the policy skips Anypoint Object Store v2 entirely and
+        keeps task state only in the per-replica in-memory hot cache.
+        Useful as an escape hatch when the OS v2 upstream is degraded;
+        tasks become per-replica and disappear on policy reload, but the
+        rest of the A2A surface keeps working. Leave false for production.
+    objectStoreTtlSeconds:
+      type: integer
+      minimum: 60
+      maximum: 2592000
+      default: 86400
+      description: |
+        TTL (seconds) applied when the policy creates the OS v2 store
+        (autoCreateStore true). Defaults to 24h. Ignored when the store
+        already exists; OS v2 does not let policies retroactively change
+        the TTL of an existing store.
     taskHotCacheTtlSeconds:
       type: integer
       minimum: 0
@@ -213,11 +243,17 @@ spec:
     agentCardProviderOrganization:
       type: string
       default: ""
-      description: AgentCard.provider.organization (structured mode).
+      description: |
+        AgentCard.provider.organization (structured mode). A2A 0.3.0 §5.5
+        requires AgentProvider to carry both organization and url, so
+        this must be set together with agentCardProviderUrl. Leave both
+        blank to omit the provider block entirely.
     agentCardProviderUrl:
       type: string
       default: ""
-      description: AgentCard.provider.url (structured mode).
+      description: |
+        AgentCard.provider.url (structured mode). Must be set together
+        with agentCardProviderOrganization (A2A 0.3.0 §5.5).
     agentCardCapabilitiesStreaming:
       type: boolean
       default: false

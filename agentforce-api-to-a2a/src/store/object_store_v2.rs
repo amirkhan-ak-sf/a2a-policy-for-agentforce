@@ -37,6 +37,19 @@ pub struct OS2Config {
     pub anypoint_token_url_for_cache_key: String,
     pub cache_safety_margin_seconds: u32,
     pub timeout_ms: u64,
+    /// When true, the policy POSTs to the OS v2 admin API on first use to
+    /// materialize the store if it doesn't already exist.
+    pub auto_create_store: bool,
+    /// Escape hatch: when true, every method on this client is a no-op
+    /// (reads return `NotFound`, writes/deletes return immediately). Used
+    /// to keep the policy serving when the Anypoint OS v2 upstream is
+    /// unhealthy. Operators trade durability (per-replica in-memory only)
+    /// for availability.
+    pub disable_object_store: bool,
+    /// TTL applied when creating the store. Ignored if the store already
+    /// exists (OS v2 doesn't allow retroactive TTL changes via the
+    /// connected-app admin endpoint).
+    pub object_store_ttl_seconds: u32,
 }
 
 #[derive(Debug, Error)]
@@ -111,6 +124,24 @@ impl ObjectStoreV2 {
         )
     }
 
+    /// Sentinel cache key written after a successful (or definitively
+    /// "store already exists") create attempt. We re-check it on every
+    /// read/write so the work happens at most once per replica.
+    fn ensure_store_cache_key(&self) -> String {
+        format!(
+            "os2_store_ready:{}:{}:{}",
+            self.cfg.anypoint_org_id, self.cfg.anypoint_env_id, self.cfg.object_store_id
+        )
+    }
+
+    fn store_admin_path(&self) -> String {
+        format!(
+            "/api/v1/organizations/{}/environments/{}/stores",
+            urlencoding::encode(&self.cfg.anypoint_org_id),
+            urlencoding::encode(&self.cfg.anypoint_env_id),
+        )
+    }
+
     fn key_path(&self, key: &str) -> String {
         // Path is matched relative to the registered Service base URL. Both
         // the path-segment values and the dynamic key are URL-encoded so
@@ -152,6 +183,7 @@ impl ObjectStoreV2 {
         ])
         .expect("urlencoded for &str is infallible");
 
+        logger::error!("a2a-trace: os2.get_token POST to anypoint-oauth2");
         let response = client
             .request(self.token_service.as_ref())
             .headers(vec![
@@ -162,12 +194,16 @@ impl ObjectStoreV2 {
             .timeout(Duration::from_secs(TOKEN_TIMEOUT_SECS))
             .post()
             .await
-            .map_err(|e| OS2Error::Transport {
-                endpoint: "anypoint-oauth2",
-                source: anyhow::anyhow!(e.to_string()),
+            .map_err(|e| {
+                logger::error!("a2a-trace: os2.get_token transport err: {}", e);
+                OS2Error::Transport {
+                    endpoint: "anypoint-oauth2",
+                    source: anyhow::anyhow!(e.to_string()),
+                }
             })?;
 
         let status = response.status_code();
+        logger::error!("a2a-trace: os2.get_token status={}", status);
         if !(200..300).contains(&status) {
             return Err(OS2Error::HttpStatus {
                 operation: "anypoint-oauth2",
@@ -188,19 +224,114 @@ impl ObjectStoreV2 {
         Ok(parsed.access_token)
     }
 
+    /// Idempotently make sure the configured store exists. On the first
+    /// call per replica we POST to the OS v2 admin endpoint; success and
+    /// "already exists" responses both flip a cache sentinel so subsequent
+    /// reads/writes skip the round-trip. Disabled via
+    /// `auto_create_store = false`.
+    pub async fn ensure_store(&self, client: &HttpClient, now_unix: u64) {
+        if self.cfg.disable_object_store {
+            return;
+        }
+        logger::error!("a2a-trace: ensure_store called auto_create={}", self.cfg.auto_create_store);
+        if !self.cfg.auto_create_store {
+            return;
+        }
+        let sentinel = self.ensure_store_cache_key();
+        if self.cache.get(&sentinel).is_some() {
+            logger::error!("a2a-trace: ensure_store sentinel hit, skip");
+            return;
+        }
+
+        logger::error!("a2a-trace: ensure_store fetching token");
+        let token = match self.get_token(client, now_unix, false).await {
+            Ok(t) => {
+                logger::error!("a2a-trace: ensure_store token ok");
+                t
+            }
+            Err(e) => {
+                logger::error!("a2a-trace: ensure_store token fetch failed: {e}");
+                return;
+            }
+        };
+        let bearer = format!("Bearer {token}");
+        let body = serde_json::json!({
+            "objectStoreId": self.cfg.object_store_id,
+            "persistent": true,
+            "ttl": self.cfg.object_store_ttl_seconds,
+        });
+        let body_bytes = serde_json::to_vec(&body).expect("static JSON serializes");
+
+        let response = client
+            .request(self.base_service.as_ref())
+            .path(&self.store_admin_path())
+            .headers(vec![
+                ("authorization", bearer.as_str()),
+                ("content-type", "application/json"),
+                ("accept", "application/json"),
+            ])
+            .body(&body_bytes)
+            .timeout(Duration::from_millis(self.cfg.timeout_ms))
+            .post()
+            .await;
+
+        match response {
+            Ok(r) => {
+                let status = r.status_code();
+                // 200/201/204: created. 409: already exists. Both mean the
+                // store is usable. Anything else is logged but we don't
+                // remember it — we'll retry on next request.
+                if (200..300).contains(&status) || status == 409 {
+                    let _ = self.cache.save(&sentinel, vec![1]);
+                    if status == 409 {
+                        logger::info!(
+                            "os2: store '{}' already exists",
+                            self.cfg.object_store_id
+                        );
+                    } else {
+                        logger::info!(
+                            "os2: created store '{}' (ttl {}s)",
+                            self.cfg.object_store_id,
+                            self.cfg.object_store_ttl_seconds
+                        );
+                    }
+                } else {
+                    let body = String::from_utf8_lossy(r.body());
+                    logger::warn!(
+                        "os2: create-store returned HTTP {status}: {} - confirm the connected app has Object Store admin scope or set autoCreateStore=false and pre-create the store",
+                        truncate(&body, 256)
+                    );
+                }
+            }
+            Err(e) => {
+                logger::warn!("os2: create-store transport error: {e}");
+            }
+        }
+    }
+
     /// Read a key. On any non-2xx-non-404 response, returns `Degraded` so
     /// the caller can treat it as "no value available".
     pub async fn get(&self, client: &HttpClient, key: &str, now_unix: u64) -> GetOutcome {
+        if self.cfg.disable_object_store {
+            return GetOutcome::NotFound;
+        }
+        logger::error!("a2a-trace: os2.get start key='{key}'");
+        self.ensure_store(client, now_unix).await;
+        logger::error!("a2a-trace: os2.get ensure_store done, fetching token");
         let token = match self.get_token(client, now_unix, false).await {
-            Ok(t) => t,
+            Ok(t) => {
+                logger::error!("a2a-trace: os2.get token ok len={}", t.len());
+                t
+            }
             Err(e) => {
-                logger::warn!("os2: token fetch failed: {e}");
+                logger::error!("a2a-trace: os2.get token fetch failed: {e}");
                 return GetOutcome::Degraded;
             }
         };
 
         let bearer = format!("Bearer {token}");
         let path = self.key_path(key);
+        logger::error!("a2a-trace: os2.get GET path='{path}'");
         let response = client
             .request(self.base_service.as_ref())
             .path(&path)
@@ -211,6 +342,7 @@ impl ObjectStoreV2 {
             .timeout(Duration::from_millis(self.cfg.timeout_ms))
             .get()
             .await;
+        logger::error!("a2a-trace: os2.get response received");
 
         match response {
             Ok(r) => {
@@ -234,6 +366,10 @@ impl ObjectStoreV2 {
     /// Best-effort write. Errors are logged at `warn` and swallowed so a
     /// transient OS v2 outage doesn't fail the user request.
     pub async fn put(&self, client: &HttpClient, key: &str, value: &[u8], now_unix: u64) {
+        if self.cfg.disable_object_store {
+            return;
+        }
+        self.ensure_store(client, now_unix).await;
         let token = match self.get_token(client, now_unix, false).await {
             Ok(t) => t,
             Err(e) => {
@@ -269,6 +405,9 @@ impl ObjectStoreV2 {
 
     /// Best-effort delete. Same error-swallowing semantics as `put`.
     pub async fn delete(&self, client: &HttpClient, key: &str, now_unix: u64) {
+        if self.cfg.disable_object_store {
+            return;
+        }
         let token = match self.get_token(client, now_unix, false).await {
             Ok(t) => t,
             Err(e) => {
@@ -300,6 +439,14 @@ impl ObjectStoreV2 {
     }
 }
 
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +461,9 @@ mod tests {
             anypoint_token_url_for_cache_key: "https://anypoint.mulesoft.com".into(),
             cache_safety_margin_seconds: 60,
             timeout_ms: 1500,
+            auto_create_store: true,
+            disable_object_store: false,
+            object_store_ttl_seconds: 86_400,
         }
     }
 

@@ -12,9 +12,12 @@ crate-type = ["cdylib", "rlib"]
 # `oauth_2_jwt_bearer` reference policy: declare the definition asset id
 # and let cargo-anypoint derive the implementation asset id.
 [package.metadata.anypoint]
-group_id = "c43e3f9c-5cda-4b72-921d-a17fc5729975"
-definition_asset_id = "agentforce-api-to-a2a"
-implementation_asset_id = "agentforce-api-to-a2a-wasm"
+group_id = "f684513f-280e-403a-ac53-80ca62e3de49"
+# The Anypoint Exchange CLI rejects asset ids whose hyphen-separated segments
+# mix letters and digits (e.g. "a2a"). Each segment must be purely alphabetic
+# or purely numeric, so "a2a" is encoded as the three segments "a-2-a".
+definition_asset_id = "agentforce-api-to-a-2-a"
+implementation_asset_id = "agentforce-api-to-a-2-a-wasm"
 
 [dependencies]
 pdk = "1.8.0"

@@ -38,7 +38,8 @@ impl Dispatcher {
         now_unix: u64,
         timestamp_iso: String,
     ) -> Result<JsonRpcSuccess, JsonRpcError> {
-        match request.method.as_str() {
+        logger::error!("a2a-trace: dispatch method='{}'", request.method);
+        let r = match request.method.as_str() {
             "message/send" => self.handle_message_send(http, request, now_unix, timestamp_iso).await,
             "tasks/get" => self.handle_tasks_get(http, request, now_unix).await,
             "tasks/cancel" => self.handle_tasks_cancel(http, request, now_unix, timestamp_iso).await,
@@ -47,7 +48,9 @@ impl Dispatcher {
                 METHOD_NOT_FOUND,
                 format!("Method not found: {other}"),
             )),
-        }
+        };
+        logger::error!("a2a-trace: dispatch done, ok={}", r.is_ok());
+        r
     }
 
     async fn handle_message_send(
@@ -139,10 +142,15 @@ impl Dispatcher {
     ) -> Result<JsonRpcSuccess, JsonRpcError> {
         let id = request.id.clone();
         let params: TaskQueryParams = require_params(&request)?;
-
+        logger::error!("a2a-trace: tasks/get id='{}'", params.id);
+        logger::error!("a2a-trace: tasks/get -> store.get_task");
         let bytes = match self.store.get_task(http, &params.id, now_unix).await {
-            Some(b) => b,
+            Some(b) => {
+                logger::error!("a2a-trace: tasks/get store hit, len={}", b.len());
+                b
+            }
             None => {
+                logger::error!("a2a-trace: tasks/get store miss");
                 return Err(JsonRpcError::new(
                     id,
                     TASK_NOT_FOUND,

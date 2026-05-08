@@ -79,15 +79,15 @@ pub fn structured_to_card(s: &StructuredCardConfig) -> Value {
         obj.insert("documentationUrl".into(), Value::String(v.clone()));
     }
 
-    let mut provider = serde_json::Map::new();
-    if let Some(v) = &s.provider_organization {
-        provider.insert("organization".into(), Value::String(v.clone()));
-    }
-    if let Some(v) = &s.provider_url {
-        provider.insert("url".into(), Value::String(v.clone()));
-    }
-    if !provider.is_empty() {
-        obj.insert("provider".into(), Value::Object(provider));
+    // A2A 0.3.0 §5.5 requires AgentProvider to carry both `organization`
+    // AND `url`. Emit the provider block only when both fields are
+    // present; otherwise drop it entirely so the resulting card is still
+    // spec-valid. The config layer rejects "only one of the two".
+    if let (Some(org), Some(url)) = (&s.provider_organization, &s.provider_url) {
+        obj.insert(
+            "provider".into(),
+            json!({ "organization": org, "url": url }),
+        );
     }
 
     obj.insert(
@@ -339,6 +339,9 @@ mod tests {
             anypoint_org_id: "o".into(),
             anypoint_env_id: "e".into(),
             object_store_id: "store".into(),
+            auto_create_store: true,
+            disable_object_store: false,
+            object_store_ttl_seconds: 86_400,
             task_hot_cache_ttl_seconds: 60,
             task_store_timeout_ms: 1500,
             agent_card_source: source,
@@ -350,7 +353,7 @@ mod tests {
                 icon_url: None,
                 documentation_url: None,
                 provider_organization: Some("Acme".into()),
-                provider_url: None,
+                provider_url: Some("https://acme.example.com".into()),
                 capabilities_streaming: false,
                 capabilities_push_notifications: false,
                 default_input_modes: vec!["text/plain".into()],
@@ -375,6 +378,19 @@ mod tests {
         assert_eq!(card["capabilities"]["streaming"], false);
         assert_eq!(card["skills"][0]["id"], "s1");
         assert_eq!(card["provider"]["organization"], "Acme");
+        assert_eq!(card["provider"]["url"], "https://acme.example.com");
+    }
+
+    #[test]
+    fn structured_card_omits_provider_when_both_blank() {
+        let mut cfg = cfg_with(AgentCardSource::Structured, None);
+        cfg.structured_card.provider_organization = None;
+        cfg.structured_card.provider_url = None;
+        let card = build_static_card(&cfg).unwrap();
+        assert!(
+            card.get("provider").is_none(),
+            "provider must be absent when neither org nor url is set, got {card}"
+        );
     }
 
     #[test]
