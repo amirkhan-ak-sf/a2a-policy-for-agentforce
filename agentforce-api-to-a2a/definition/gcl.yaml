@@ -31,11 +31,22 @@ spec:
     agentforceApiUrl:
       type: string
       format: service
-      default: https://api.salesforce.com/einstein/ai-agent/v1
+      default: https://api.salesforce.com
       description: |
-        Base URL of the Agentforce Agents API. Defaults to the public host;
-        operators on a sandbox should override. Registered as a separate
-        Envoy upstream cluster.
+        Host-only base URL of the Agentforce Agents API. Registered as
+        an Envoy upstream cluster, so it MUST be host-only (no path
+        component). The API path prefix is provided separately via
+        `agentforceApiBasePath`. We split host and path because some
+        Flex Gateway runtime modes register path-bearing service URLs
+        as upstream clusters in a way that traps WASM outbound calls.
+    agentforceApiBasePath:
+      type: string
+      default: /einstein/ai-agent/v1
+      description: |
+        Path prefix to append to all Agentforce REST calls. Combined
+        with `agentforceApiUrl` to form the full request path. Defaults
+        to the public Agentforce v1 surface; override for sandbox
+        endpoints.
     consumerKey:
       type: string
       description: |
@@ -45,6 +56,14 @@ spec:
       type: string
       format: password
       description: External Connected App consumer secret (OAuth client_secret).
+    agentforceAccessTokenOverride:
+      type: string
+      format: password
+      default: ""
+      description: |
+        Optional diagnostic override. When set, the policy skips the
+        Salesforce OAuth client_credentials exchange and uses this bearer
+        token for Agentforce calls. Leave blank for normal operation.
     agentId:
       type: string
       description: |
@@ -295,6 +314,38 @@ spec:
         agent card resolved from the chosen source. Useful for
         overriding a single field (e.g. extra securitySchemes) without
         rewriting the whole card.
+
+    diagnosticPreBodyProbe:
+      type: boolean
+      default: false
+      description: |
+        Diagnostic only. When true, the policy issues a probe outbound
+        HTTPS call to myDomainUrl BEFORE transitioning to the request
+        body state, then continues with the normal flow. Used to test
+        whether connected-mode runtime breaks outbound HTTPS only after
+        the request body has been read. Leave false in production.
+    diagnosticPreBodyAgentforceProbe:
+      type: boolean
+      default: false
+      description: |
+        Diagnostic only. When true, the policy issues a probe outbound
+        call to the Agentforce API (start_session) in the request
+        headers state, before reading the body. Used to test whether
+        the connected-mode trap is host-specific to the Agentforce
+        upstream cluster, or whether the trap requires the
+        post-body-state context. Leave false in production.
+    diagnosticContinueFlow:
+      type: boolean
+      default: false
+      description: |
+        Diagnostic only. When true, the policy still performs all
+        outbound calls and builds the A2A response Task, but returns
+        Flow::Continue at the end of message/send instead of short-
+        circuiting with Flow::Break. The upstream then sees the original
+        request and the policy's synthetic response is discarded. Used
+        to test whether connected-mode runtime breaks specifically when
+        Flow::Break follows outbound HTTPS calls. Leave false in
+        production.
   required:
     - myDomainUrl
     - agentforceApiUrl

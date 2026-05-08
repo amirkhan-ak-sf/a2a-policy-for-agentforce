@@ -12,7 +12,6 @@ use std::rc::Rc;
 
 use pdk::hl::HttpClient;
 use pdk::logger;
-use uuid::Uuid;
 
 use crate::a2a::mapping;
 use crate::a2a::types::{
@@ -78,7 +77,10 @@ impl Dispatcher {
         let task_id = match params.message.task_id.clone() {
             Some(id) if !id.is_empty() => id,
             _ => {
-                let external_session_key = Uuid::new_v4().to_string();
+                // Avoid runtime randomness in the WASM module. Some Flex
+                // Gateway hosts expose limited WASI support, so use the A2A
+                // message id as stable caller-provided correlation material.
+                let external_session_key = params.message.message_id.clone();
                 let session = self
                     .client
                     .start_session(http, &external_session_key, now_unix)

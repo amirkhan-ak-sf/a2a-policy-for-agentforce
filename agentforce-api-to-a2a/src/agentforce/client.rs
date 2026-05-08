@@ -15,7 +15,6 @@
 //! before surfacing `ClientError::AuthRejected`.
 
 use std::rc::Rc;
-use std::time::Duration;
 
 use pdk::hl::{HttpClient, Service};
 use pdk::logger;
@@ -24,8 +23,6 @@ use thiserror::Error;
 use urlencoding;
 
 use crate::agentforce::auth::{AgentforceAuth, AuthError};
-
-const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -247,7 +244,6 @@ impl AgentforceClient {
                 ("accept", "application/json"),
             ])
             .body(body)
-            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .post()
             .await
             .map_err(|e| ClientError::Transport {
@@ -330,7 +326,6 @@ impl AgentforceClient {
                 ("accept", "application/json"),
             ])
             .body(body)
-            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .post()
             .await
             .map_err(|e| ClientError::Transport {
@@ -390,7 +385,6 @@ impl AgentforceClient {
             .request(self.api.as_ref())
             .path(path)
             .headers(vec![("authorization", bearer.as_str())])
-            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .delete()
             .await
             .map_err(|e| ClientError::Transport {

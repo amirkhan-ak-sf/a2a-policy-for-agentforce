@@ -43,6 +43,10 @@ pub struct Config {
     pub agent_card_version: Option<String>,
     #[serde(alias = "agentId")]
     pub agent_id: String,
+    #[serde(alias = "agentforceAccessTokenOverride")]
+    pub agentforce_access_token_override: Option<String>,
+    #[serde(alias = "agentforceApiBasePath")]
+    pub agentforce_api_base_path: Option<String>,
     #[serde(
         alias = "agentforceApiUrl",
         deserialize_with = "pdk::serde::deserialize_service"
@@ -71,6 +75,12 @@ pub struct Config {
     pub consumer_key: String,
     #[serde(alias = "consumerSecret")]
     pub consumer_secret: String,
+    #[serde(alias = "diagnosticContinueFlow")]
+    pub diagnostic_continue_flow: Option<bool>,
+    #[serde(alias = "diagnosticPreBodyAgentforceProbe")]
+    pub diagnostic_pre_body_agentforce_probe: Option<bool>,
+    #[serde(alias = "diagnosticPreBodyProbe")]
+    pub diagnostic_pre_body_probe: Option<bool>,
     #[serde(alias = "disableObjectStore")]
     pub disable_object_store: Option<bool>,
     #[serde(alias = "myDomainUrl", deserialize_with = "pdk::serde::deserialize_service")]

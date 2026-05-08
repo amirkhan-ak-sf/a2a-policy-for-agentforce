@@ -15,7 +15,6 @@
 //! best-effort (a failed write logs at warn and the RPC still succeeds).
 
 use std::rc::Rc;
-use std::time::Duration;
 
 use pdk::cache::Cache;
 use pdk::hl::{HttpClient, Service};
@@ -81,8 +80,6 @@ struct TokenResponse {
 fn default_expires_in() -> u64 {
     1800
 }
-
-const TOKEN_TIMEOUT_SECS: u64 = 5;
 
 /// Outcome of a `get` against the persistent store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,7 +188,6 @@ impl ObjectStoreV2 {
                 ("accept", "application/json"),
             ])
             .body(body.as_bytes())
-            .timeout(Duration::from_secs(TOKEN_TIMEOUT_SECS))
             .post()
             .await
             .map_err(|e| {
@@ -271,7 +267,6 @@ impl ObjectStoreV2 {
                 ("accept", "application/json"),
             ])
             .body(&body_bytes)
-            .timeout(Duration::from_millis(self.cfg.timeout_ms))
             .post()
             .await;
 
@@ -339,7 +334,6 @@ impl ObjectStoreV2 {
                 ("authorization", bearer.as_str()),
                 ("accept", "application/json"),
             ])
-            .timeout(Duration::from_millis(self.cfg.timeout_ms))
             .get()
             .await;
         logger::error!("a2a-trace: os2.get response received");
@@ -387,7 +381,6 @@ impl ObjectStoreV2 {
                 ("content-type", "application/json"),
             ])
             .body(value)
-            .timeout(Duration::from_millis(self.cfg.timeout_ms))
             .put()
             .await;
         match response {
@@ -421,7 +414,6 @@ impl ObjectStoreV2 {
             .request(self.base_service.as_ref())
             .path(&path)
             .headers(vec![("authorization", bearer.as_str())])
-            .timeout(Duration::from_millis(self.cfg.timeout_ms))
             .delete()
             .await;
         match response {

@@ -327,6 +327,7 @@ mod tests {
         PolicyConfig {
             consumer_key: "k".into(),
             consumer_secret: "s".into(),
+            agentforce_access_token_override: None,
             agent_id: "a".into(),
             bypass_user: true,
             cache_safety_margin_seconds: 60,
@@ -342,6 +343,9 @@ mod tests {
             auto_create_store: true,
             disable_object_store: false,
             object_store_ttl_seconds: 86_400,
+            diagnostic_pre_body_probe: false,
+            diagnostic_pre_body_agentforce_probe: false,
+            diagnostic_continue_flow: false,
             task_hot_cache_ttl_seconds: 60,
             task_store_timeout_ms: 1500,
             agent_card_source: source,

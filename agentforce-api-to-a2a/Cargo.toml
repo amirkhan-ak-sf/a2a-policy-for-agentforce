@@ -28,8 +28,6 @@ anyhow = "1.0"
 thiserror = "1"
 base64 = "0.22"
 sha2 = "0.10"
-uuid = { version = "1", features = ["v4"] }
-getrandom = { version = "0.2", features = ["js"] }
 urlencoding = "2.1"
 
 [dev-dependencies]

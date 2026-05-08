@@ -133,6 +133,7 @@ pub struct PolicyConfig {
     // Agentforce
     pub consumer_key: String,
     pub consumer_secret: String,
+    pub agentforce_access_token_override: Option<String>,
     pub agent_id: String,
     pub bypass_user: bool,
     pub cache_safety_margin_seconds: u32,
@@ -160,6 +161,12 @@ pub struct PolicyConfig {
     pub agent_card_json: Option<String>,
     pub structured_card: StructuredCardConfig,
     pub agent_card_override: Option<serde_json::Value>,
+
+    // Diagnostic flags. Used to A/B test the connected-mode WASM trap
+    // hypothesis. Both default to false in production.
+    pub diagnostic_pre_body_probe: bool,
+    pub diagnostic_pre_body_agentforce_probe: bool,
+    pub diagnostic_continue_flow: bool,
 }
 
 /// Raw, untyped view of the configuration. The generated codegen produces a
@@ -170,6 +177,7 @@ pub struct PolicyConfig {
 pub struct RawConfig {
     pub consumer_key: Option<String>,
     pub consumer_secret: Option<String>,
+    pub agentforce_access_token_override: Option<String>,
     pub agent_id: Option<String>,
     pub bypass_user: Option<bool>,
     pub cache_safety_margin_seconds: Option<i64>,
@@ -211,6 +219,10 @@ pub struct RawConfig {
     pub agent_card_skills_json: Option<String>,
     pub agent_card_security_schemes_json: Option<String>,
     pub agent_card_override_json: Option<String>,
+
+    pub diagnostic_pre_body_probe: Option<bool>,
+    pub diagnostic_pre_body_agentforce_probe: Option<bool>,
+    pub diagnostic_continue_flow: Option<bool>,
 }
 
 impl PolicyConfig {
@@ -220,6 +232,10 @@ impl PolicyConfig {
             raw.consumer_secret.clone(),
             ConfigError::MissingConsumerSecret,
         )?;
+        let agentforce_access_token_override = raw
+            .agentforce_access_token_override
+            .clone()
+            .filter(|s| !s.trim().is_empty());
         let agent_id = nonempty(raw.agent_id.clone(), ConfigError::MissingAgentId)?;
         let public_base_url =
             nonempty(raw.public_base_url.clone(), ConfigError::MissingPublicBaseUrl)?;
@@ -289,6 +305,7 @@ impl PolicyConfig {
         Ok(Self {
             consumer_key,
             consumer_secret,
+            agentforce_access_token_override,
             agent_id,
             bypass_user,
             cache_safety_margin_seconds,
@@ -313,6 +330,12 @@ impl PolicyConfig {
             agent_card_json,
             structured_card,
             agent_card_override,
+
+            diagnostic_pre_body_probe: raw.diagnostic_pre_body_probe.unwrap_or(false),
+            diagnostic_pre_body_agentforce_probe: raw
+                .diagnostic_pre_body_agentforce_probe
+                .unwrap_or(false),
+            diagnostic_continue_flow: raw.diagnostic_continue_flow.unwrap_or(false),
         })
     }
 }

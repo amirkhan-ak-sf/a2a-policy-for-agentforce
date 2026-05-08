@@ -14,7 +14,6 @@
 //! reactive retry is implemented in `client::with_bearer_retry`.
 
 use std::rc::Rc;
-use std::time::Duration;
 
 use pdk::cache::Cache;
 use pdk::hl::{HttpClient, Service};
@@ -27,11 +26,6 @@ use crate::cache::{token_cache_key, CachedToken, AGENTFORCE_TOKEN_PREFIX};
 /// Conservative default lifetime we apply when the IdP omits `expires_in`.
 const DEFAULT_EXPIRES_IN_SECS: u64 = 300;
 
-/// Per-call timeout for the token POST. Salesforce typically responds in
-/// well under a second; tighter than this and we start losing legitimately
-/// slow first-time callers.
-const TOKEN_REQUEST_TIMEOUT_SECS: u64 = 5;
-
 /// Path appended to the My Domain URL.
 pub const SALESFORCE_TOKEN_PATH: &str = "/services/oauth2/token";
 
@@ -39,6 +33,7 @@ pub const SALESFORCE_TOKEN_PATH: &str = "/services/oauth2/token";
 pub struct AgentforceAuthConfig {
     pub consumer_key: String,
     pub consumer_secret: String,
+    pub access_token_override: Option<String>,
     /// Used as the cache-key salt and in the Service host disambiguation.
     pub my_domain_url_for_cache_key: String,
     pub cache_safety_margin_seconds: u32,
@@ -153,6 +148,11 @@ impl AgentforceAuth {
         now_unix: u64,
         force_refresh: bool,
     ) -> Result<String, AuthError> {
+        if let Some(token) = self.cfg.access_token_override.as_deref() {
+            logger::warn!("agentforce-auth: using configured access token override");
+            return Ok(token.to_string());
+        }
+
         let key = self.cache_key();
 
         if !force_refresh {
@@ -181,7 +181,6 @@ impl AgentforceAuth {
                 ("accept", "application/json"),
             ])
             .body(body.as_bytes())
-            .timeout(Duration::from_secs(TOKEN_REQUEST_TIMEOUT_SECS))
             .post();
 
         let response = request.await.map_err(|e| AuthError::Transport {

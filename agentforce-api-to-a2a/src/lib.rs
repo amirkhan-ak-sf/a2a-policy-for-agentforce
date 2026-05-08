@@ -1,13 +1,38 @@
 //! Agentforce API -> A2A 0.3.0 server policy.
 //!
-//! On request:
+//! Two-phase architecture:
 //!
+//! On request (`on_request`):
 //!   1. Classify the path (`agent-card`, `a2a-rpc`, or passthrough).
 //!   2. agent-card: short-circuit with the cached/fetched AgentCard JSON.
-//!   3. a2a-rpc:    read the body, parse JSON-RPC, dispatch to
-//!                  `message/send` | `tasks/get` | `tasks/cancel`,
-//!                  short-circuit with the JSON-RPC response.
+//!   3. a2a-rpc: read the body, parse JSON-RPC.
+//!      - For `message/send` (which needs outbound calls to Salesforce):
+//!        record the parsed request as `A2APending::MessageSend` and
+//!        return `Flow::Continue` so the request flows to upstream. The
+//!        actual outbound calls are deferred to the response phase.
+//!      - For methods that do not require outbound (e.g. `tasks/get` /
+//!        `tasks/cancel` when the task is missing or OS2 is disabled):
+//!        dispatch synchronously and short-circuit with the JSON-RPC
+//!        response.
+//!      - For unknown methods or malformed bodies: short-circuit with
+//!        the appropriate JSON-RPC error.
 //!   4. passthrough: continue (or 404 if `strictMode = true`).
+//!
+//! On response (`on_response`):
+//!   - If the request phase deferred a `message/send`, re-parse the
+//!     JSON-RPC body, dispatch (this is where outbound HTTPS calls to
+//!     Salesforce/Agentforce happen), and replace the upstream's
+//!     response with the policy-built A2A `Task` JSON via
+//!     `ResponseHeadersState::send_response`.
+//!   - Otherwise, let the upstream's response pass through unchanged.
+//!
+//! The reason for the two-phase split is a connected-mode Flex Gateway
+//! runtime quirk: outbound HTTPS issued from a WASM filter after
+//! `request.into_body_state().await` traps the filter (returning an
+//! empty-body 404 to the client). The same outbound issued before the
+//! body-state transition, or from the response phase, works fine. By
+//! moving the multi-step Agentforce orchestration to `on_response` we
+//! avoid issuing any outbound from the body-state phase of the request.
 
 mod a2a;
 mod agent_card;
@@ -33,7 +58,7 @@ use crate::agentforce::auth::{AgentforceAuth, AgentforceAuthConfig};
 use crate::agentforce::client::AgentforceClient;
 use crate::config::{PolicyConfig, RawConfig};
 use crate::generated::config::Config;
-use crate::jsonrpc::{JsonRpcError, INVALID_REQUEST};
+use crate::jsonrpc::{JsonRpcError, INVALID_REQUEST, METHOD_NOT_FOUND};
 use crate::router::{classify, Route};
 use crate::store::object_store_v2::{OS2Config, ObjectStoreV2};
 use crate::store::task_store::TaskStore;
@@ -69,8 +94,6 @@ fn unix_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let min = (secs_of_day % 3600) / 60;
     let sec = secs_of_day % 60;
 
-    // 1970-01-01 was a Thursday; not needed here. Compute calendar from
-    // days since epoch.
     let mut year = 1970i64;
     loop {
         let leap = is_leap(year);
@@ -110,6 +133,7 @@ impl From<&Config> for RawConfig {
         RawConfig {
             consumer_key: Some(c.consumer_key.clone()),
             consumer_secret: Some(c.consumer_secret.clone()),
+            agentforce_access_token_override: c.agentforce_access_token_override.clone(),
             agent_id: Some(c.agent_id.clone()),
             bypass_user: c.bypass_user,
             cache_safety_margin_seconds: c.cache_safety_margin_seconds,
@@ -144,6 +168,10 @@ impl From<&Config> for RawConfig {
             agent_card_skills_json: c.agent_card_skills_json.clone(),
             agent_card_security_schemes_json: c.agent_card_security_schemes_json.clone(),
             agent_card_override_json: c.agent_card_override_json.clone(),
+
+            diagnostic_pre_body_probe: c.diagnostic_pre_body_probe,
+            diagnostic_pre_body_agentforce_probe: c.diagnostic_pre_body_agentforce_probe,
+            diagnostic_continue_flow: c.diagnostic_continue_flow,
         }
     }
 }
@@ -153,13 +181,35 @@ struct PolicyState {
     cfg: Rc<PolicyConfig>,
     card: Rc<CardProvider>,
     dispatcher: Rc<Dispatcher>,
+    /// Held only so the diagnostic pre-body probe can call
+    /// `auth.get_token` from the `RequestHeaders` state. Outside of the
+    /// diagnostic path, `auth` is owned by `dispatcher` already.
+    auth: Rc<AgentforceAuth>,
+}
+
+/// User data carried from the request phase to the response phase.
+#[derive(Clone, Debug)]
+enum A2APending {
+    /// Pass-through (non-A2A request, or strict-mode-allowed); response
+    /// phase is a no-op and the upstream's response flows through
+    /// unchanged.
+    PassThrough,
+    /// `message/send` was deferred to the response phase. Carry the
+    /// parsed JSON-RPC id and the raw body so the response handler can
+    /// re-parse and dispatch.
+    MessageSend {
+        id: Option<serde_json::Value>,
+        body: Vec<u8>,
+        now_unix: u64,
+        now_iso: String,
+    },
 }
 
 async fn request_filter(
     request: RequestHeadersState,
     state: PolicyState,
     client: HttpClient,
-) -> Flow<()> {
+) -> Flow<A2APending> {
     let method = request.method();
     let path = request.path();
     let route = classify(&method, &path, &state.cfg.a2a_rpc_path);
@@ -182,7 +232,7 @@ async fn request_filter(
                 ))
             }
         },
-        Route::A2aRpc => handle_rpc(request, state, client).await,
+        Route::A2aRpc => handle_rpc_request(request, state, client).await,
         Route::Passthrough => {
             if state.cfg.strict_mode {
                 Flow::Break(make_json_response(
@@ -190,17 +240,17 @@ async fn request_filter(
                     br#"{"error":"not_found","reason":"strictMode"}"#,
                 ))
             } else {
-                Flow::Continue(())
+                Flow::Continue(A2APending::PassThrough)
             }
         }
     }
 }
 
-async fn handle_rpc(
+async fn handle_rpc_request(
     request: RequestHeadersState,
     state: PolicyState,
     client: HttpClient,
-) -> Flow<()> {
+) -> Flow<A2APending> {
     logger::error!("a2a-trace: handle_rpc enter");
     if !request.contains_body() {
         logger::error!("a2a-trace: handle_rpc no body");
@@ -222,18 +272,125 @@ async fn handle_rpc(
     };
     logger::error!("a2a-trace: handle_rpc parsed method='{}'", parsed.method);
 
-    let result = state
-        .dispatcher
-        .dispatch(&client, parsed, now_unix(), now_iso())
-        .await;
-    logger::error!("a2a-trace: handle_rpc dispatch returned");
+    match parsed.method.as_str() {
+        "message/send" => {
+            // Connected-mode Flex Gateway traps WASM outbound HTTPS made
+            // after the request body has been read. Defer the actual
+            // dispatch (and its outbound calls) to the response phase by
+            // returning Flow::Continue with the parsed body. The response
+            // phase will replace the upstream's response with the
+            // policy-built A2A Task.
+            logger::error!(
+                "a2a-trace: handle_rpc deferring message/send to response phase"
+            );
+            Flow::Continue(A2APending::MessageSend {
+                id: parsed.id,
+                body: body.to_vec(),
+                now_unix: now_unix(),
+                now_iso: now_iso(),
+            })
+        }
+        "tasks/get" | "tasks/cancel" => {
+            // These can be served synchronously when no outbound is
+            // required (missing task with `disableObjectStore=true`).
+            // When OS2 is enabled and the task exists, the dispatcher
+            // makes outbound calls — that path will trap in connected
+            // mode and is a known limitation of this v1.
+            let id = parsed.id.clone();
+            let result = state
+                .dispatcher
+                .dispatch(&client, parsed, now_unix(), now_iso())
+                .await;
+            logger::error!("a2a-trace: handle_rpc dispatch returned (sync)");
+            let bytes = match result {
+                Ok(success) => success.into_bytes(),
+                Err(err) => err.into_bytes(),
+            };
+            // Suppress unused-warning when id is borrowed only for logs.
+            let _ = id;
+            Flow::Break(make_json_response(200, &bytes))
+        }
+        _ => {
+            // Unknown method - synthesize -32601 immediately, no outbound.
+            let err = JsonRpcError::new(
+                parsed.id.clone(),
+                METHOD_NOT_FOUND,
+                format!("Method not found: {}", parsed.method),
+            );
+            Flow::Break(make_json_response(200, err.into_bytes().as_slice()))
+        }
+    }
+}
 
-    let bytes = match result {
-        Ok(success) => success.into_bytes(),
-        Err(err) => err.into_bytes(),
+/// Response-phase handler. When the request phase deferred a
+/// `message/send`, this is where the Salesforce / Agentforce outbound
+/// calls happen and the upstream's response is replaced with the
+/// policy-built A2A `Task` JSON.
+async fn response_filter(
+    response: ResponseHeadersState,
+    state: PolicyState,
+    client: HttpClient,
+    data: RequestData<A2APending>,
+) {
+    let pending = match data {
+        RequestData::Continue(pending) => pending,
+        RequestData::Break | RequestData::Cancel => {
+            // Nothing to do; the request phase already produced the final
+            // response or the flow was cancelled.
+            return;
+        }
     };
-    logger::error!("a2a-trace: handle_rpc emitting response, len={}", bytes.len());
-    Flow::Break(make_json_response(200, &bytes))
+
+    match pending {
+        A2APending::PassThrough => {
+            // Non-A2A pass-through: leave the upstream response alone.
+        }
+        A2APending::MessageSend {
+            id,
+            body,
+            now_unix,
+            now_iso,
+        } => {
+            logger::error!("a2a-trace: response_filter handling deferred message/send");
+
+            let parsed = match jsonrpc::parse_request(&body) {
+                Ok(r) => r,
+                Err(err) => {
+                    response.send_response(make_json_response(
+                        200,
+                        err.into_bytes().as_slice(),
+                    ));
+                    return;
+                }
+            };
+
+            // Outbound HTTPS to Salesforce / Agentforce happens here, in
+            // the response phase, where connected-mode Flex Gateway does
+            // not exhibit the body-state outbound trap.
+            let result = state
+                .dispatcher
+                .dispatch(&client, parsed, now_unix, now_iso)
+                .await;
+            logger::error!(
+                "a2a-trace: response_filter dispatch returned ok={}",
+                result.is_ok()
+            );
+
+            // Unused now: id is already inside the JsonRpcSuccess/Error.
+            let _ = id;
+
+            let bytes = match result {
+                Ok(success) => success.into_bytes(),
+                Err(err) => err.into_bytes(),
+            };
+
+            logger::error!(
+                "a2a-trace: response_filter replacing upstream response, len={}",
+                bytes.len()
+            );
+            response.send_response(make_json_response(200, &bytes));
+        }
+    }
 }
 
 fn make_json_response(status: u32, body: &[u8]) -> Response {
@@ -260,36 +417,44 @@ pub async fn configure(
 
     let cache: Rc<dyn Cache> = Rc::from(cache_builder.new(CACHE_ID.to_string()).shared().build());
 
-    // Extract upstream Services. These are already registered as Envoy
-    // upstream clusters by `init` in `generated::config`.
-    let my_domain_service = Rc::new(raw.my_domain_url.clone());
-    let agentforce_api_service = Rc::new(raw.agentforce_api_url.clone());
-    let object_store_service = Rc::new(raw.object_store_base_url.clone());
-    let anypoint_token_service = Rc::new(raw.anypoint_token_url.clone());
-    let agent_card_url_service = raw.agent_card_url.clone().map(Rc::new);
+    let Config {
+        my_domain_url,
+        agentforce_api_url,
+        agentforce_api_base_path: cfg_base_path,
+        object_store_base_url,
+        anypoint_token_url,
+        agent_card_url,
+        ..
+    } = raw;
+    let my_domain_service = Rc::new(my_domain_url);
+    let agentforce_api_service = Rc::new(agentforce_api_url);
+    let object_store_service = Rc::new(object_store_base_url);
+    let anypoint_token_service = Rc::new(anypoint_token_url);
+    let agent_card_url_service = agent_card_url.map(Rc::new);
 
     let my_domain_authority = my_domain_service.uri().authority().to_string();
     let my_domain_scheme = my_domain_service.uri().scheme().to_string();
     let my_domain_url_value = format!("{my_domain_scheme}://{my_domain_authority}");
     let anypoint_token_authority = anypoint_token_service.uri().authority().to_string();
 
-    // PDK's RequestBuilder::path() *replaces* the registered Service URI's
-    // path; it does not append. So if the operator configured
-    // `agentforceApiUrl: https://api.salesforce.com/einstein/ai-agent/v1`,
-    // a `.path("/agents/.../sessions")` outbound call would land at
-    // `https://api.salesforce.com/agents/.../sessions` and 404. We capture
-    // the base path here and prepend it inside AgentforceClient.
-    let agentforce_api_base_path = agentforce_api_service.uri().path().to_string();
+    // Prefer the explicit `agentforceApiBasePath` config field (the
+    // host-only registered Service is friendlier to connected-mode
+    // upstream clusters); fall back to whatever path the registered
+    // Service URI carries for backward compatibility.
+    let agentforce_api_base_path = match cfg_base_path {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => agentforce_api_service.uri().path().to_string(),
+    };
     logger::info!(
         "agentforce-client: api base path = '{}'",
         agentforce_api_base_path
     );
 
-    // Salesforce/Agentforce auth.
     let auth = Rc::new(AgentforceAuth::new(
         AgentforceAuthConfig {
             consumer_key: cfg.consumer_key.clone(),
             consumer_secret: cfg.consumer_secret.clone(),
+            access_token_override: cfg.agentforce_access_token_override.clone(),
             my_domain_url_for_cache_key: my_domain_authority.clone(),
             cache_safety_margin_seconds: cfg.cache_safety_margin_seconds,
         },
@@ -297,7 +462,6 @@ pub async fn configure(
         my_domain_service.clone(),
     ));
 
-    // Agentforce client.
     let agentforce_client = Rc::new(AgentforceClient::new(
         auth.clone(),
         agentforce_api_service.clone(),
@@ -307,7 +471,6 @@ pub async fn configure(
         cfg.bypass_user,
     ));
 
-    // Object Store v2 + TaskStore.
     let os2 = Rc::new(ObjectStoreV2::new(
         OS2Config {
             anypoint_client_id: cfg.anypoint_client_id.clone(),
@@ -337,7 +500,6 @@ pub async fn configure(
         store: task_store.clone(),
     });
 
-    // Agent card.
     let card = Rc::new(CardProvider::new(
         cfg.clone(),
         cache.clone(),
@@ -351,12 +513,21 @@ pub async fn configure(
         cfg: cfg.clone(),
         card,
         dispatcher,
+        auth: auth.clone(),
     };
 
+    let request_state = state.clone();
+    let response_state = state;
     let filter = on_request(move |request, client: HttpClient| {
-        let state = state.clone();
+        let state = request_state.clone();
         async move { request_filter(request, state, client).await }
-    });
+    })
+    .on_response(
+        move |response, client: HttpClient, data: RequestData<A2APending>| {
+            let state = response_state.clone();
+            async move { response_filter(response, state, client, data).await }
+        },
+    );
 
     launcher.launch(filter).await?;
     Ok(())

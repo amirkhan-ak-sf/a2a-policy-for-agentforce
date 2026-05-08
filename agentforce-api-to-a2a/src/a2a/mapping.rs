@@ -2,8 +2,6 @@
 //!
 //! Pure functions; no I/O. Tested without spinning up the PDK runtime.
 
-use uuid::Uuid;
-
 use crate::a2a::types::{Artifact, Message, Part, Task, TaskState, TaskStatus};
 use crate::agentforce::client::{AgentforceMessage, SendMessageResponse};
 
@@ -12,7 +10,7 @@ use crate::agentforce::client::{AgentforceMessage, SendMessageResponse};
 pub fn user_message(text: &str, task_id: &str, message_id: Option<String>) -> Message {
     let mut m = Message::new(
         "user",
-        message_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        message_id.unwrap_or_else(|| format!("user-{task_id}")),
         vec![Part::text(text.to_string())],
     );
     m.task_id = Some(task_id.into());
@@ -47,7 +45,7 @@ pub fn agent_response_to_a2a(
         .messages
         .first()
         .and_then(|m| m.id.clone())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+        .unwrap_or_else(|| format!("agent-response-{task_id}"));
 
     let mut msg = Message::new("agent", agent_message_id.clone(), parts.clone());
     msg.task_id = Some(task_id.into());
