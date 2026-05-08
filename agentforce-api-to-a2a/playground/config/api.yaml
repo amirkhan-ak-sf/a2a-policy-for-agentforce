@@ -1,0 +1,66 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: ApiInstance
+metadata:
+  name: ingress-http
+spec:
+  address: http://0.0.0.0:8081
+  services:
+    upstream:
+      # The policy short-circuits the A2A surface on its own; the upstream is
+      # only hit for non-A2A requests. Pointing it at httpbin keeps the
+      # playground simple. Set 'strictMode: true' below to disable
+      # passthrough entirely.
+      address: http://backend
+      routes:
+        - config:
+            destinationPath: /anything/echo/
+  policies:
+    - policyRef:
+        name: agentforce-api-to-a2a-flex-v1-0 # overridden by `make run`
+      # Replace the dummies with real values before deploying. The
+      # `make run` target overrides only the policyRef.name; everything else
+      # comes from this file.
+      config:
+        myDomainUrl: https://acme.my.salesforce.com
+        agentforceApiUrl: https://api.salesforce.com/einstein/ai-agent/v1
+        consumerKey: REPLACE_ME_CONSUMER_KEY
+        consumerSecret: REPLACE_ME_CONSUMER_SECRET
+        agentId: 0XXxx00000000000000
+        bypassUser: true
+        cacheSafetyMarginSeconds: 60
+
+        protocolVersion: "0.3.0"
+        a2aRpcPath: "/"
+        publicBaseUrl: http://localhost:8081/agentforce
+        strictMode: false
+
+        objectStoreBaseUrl: https://object-store-us-east-1.anypoint.mulesoft.com
+        anypointTokenUrl: https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token
+        anypointClientId: REPLACE_ME_ANYPOINT_CLIENT_ID
+        anypointClientSecret: REPLACE_ME_ANYPOINT_CLIENT_SECRET
+        anypointOrgId: 00000000-0000-0000-0000-000000000000
+        anypointEnvId: 00000000-0000-0000-0000-000000000000
+        objectStoreId: a2a-tasks
+        taskHotCacheTtlSeconds: 60
+        taskStoreTimeoutMs: 1500
+
+        agentCardSource: structured
+        agentCardName: Acme Agentforce Agent
+        agentCardDescription: A2A wrapper around the Agentforce Agents API.
+        agentCardVersion: "1.0.0"
+        agentCardProviderOrganization: Acme, Inc.
+        agentCardCapabilitiesStreaming: false
+        agentCardCapabilitiesPushNotifications: false
+        agentCardDefaultInputModes: text/plain
+        agentCardDefaultOutputModes: text/plain
+        agentCardSkillsJson: |
+          [
+            {
+              "id": "general-conversation",
+              "name": "General Conversation",
+              "description": "Have a sync conversation with the Agentforce agent over A2A.",
+              "tags": ["agentforce","general"]
+            }
+          ]

@@ -1,0 +1,275 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: Agentforce API to A2A
+    description: |
+      Wraps the Salesforce Agentforce Agents API as an A2A 0.3.0 JSON-RPC
+      server. Exposes /.well-known/agent-card.json and translates A2A
+      message/send + tasks/get + tasks/cancel into Agentforce
+      startSession / sendMessage / endSession.
+    category: AI
+    metadata/interfaceScope: api,resource
+    metadata/capabilities/injectionPoint: inbound
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    # ---------------------------------------------------------------------
+    # Agentforce: connected app + endpoints
+    # ---------------------------------------------------------------------
+    myDomainUrl:
+      type: string
+      format: service
+      description: |
+        Your Salesforce My Domain URL, e.g. https://acme.my.salesforce.com.
+        The OAuth /services/oauth2/token endpoint is reached at
+        <myDomainUrl>/services/oauth2/token. Registered as an Envoy
+        upstream cluster at deploy time.
+    agentforceApiUrl:
+      type: string
+      format: service
+      default: https://api.salesforce.com/einstein/ai-agent/v1
+      description: |
+        Base URL of the Agentforce Agents API. Defaults to the public host;
+        operators on a sandbox should override. Registered as a separate
+        Envoy upstream cluster.
+    consumerKey:
+      type: string
+      description: |
+        External Connected App consumer key (OAuth client_id) configured
+        with the Client Credentials Flow.
+    consumerSecret:
+      type: string
+      format: password
+      description: External Connected App consumer secret (OAuth client_secret).
+    agentId:
+      type: string
+      description: |
+        Salesforce Agentforce agent id, used in
+        POST /agents/{agentId}/sessions. Found in the URL of the agent's
+        details page in Setup.
+    bypassUser:
+      type: boolean
+      default: true
+      description: |
+        Agentforce bypassUser flag. true uses the agent-assigned user
+        (correct for client_credentials flows); false uses the user
+        associated with the access token.
+    cacheSafetyMarginSeconds:
+      type: integer
+      minimum: 0
+      maximum: 600
+      default: 60
+      description: Refresh the OAuth access token this many seconds before expires_in.
+
+    # ---------------------------------------------------------------------
+    # A2A protocol
+    # ---------------------------------------------------------------------
+    protocolVersion:
+      type: string
+      enum:
+        - 0.3.0
+      default: 0.3.0
+      description: |
+        A2A protocol version implemented by this policy. Currently only
+        0.3.0 is supported; 1.0.0 will be added when the spec ships.
+    a2aRpcPath:
+      type: string
+      default: /
+      description: |
+        Relative path under the governed API where JSON-RPC requests are
+        accepted. Defaults to /. The agent card is always served at
+        <base>/.well-known/agent-card.json regardless of this value.
+    publicBaseUrl:
+      type: string
+      description: |
+        Externally reachable base URL of the governed A2A endpoint, used
+        to populate AgentCard.url. The policy overrides whatever 'url'
+        the operator-supplied agent card declares so it cannot lie about
+        where it is hosted.
+    strictMode:
+      type: boolean
+      default: false
+      description: |
+        When true, requests that do not match the A2A surface
+        (agent-card.json or POST <a2aRpcPath>) are short-circuited with a
+        404. When false, non-A2A requests are forwarded to the upstream.
+
+    # ---------------------------------------------------------------------
+    # Anypoint Object Store v2: persistent task store
+    # ---------------------------------------------------------------------
+    objectStoreBaseUrl:
+      type: string
+      format: service
+      description: |
+        Region-scoped Anypoint Object Store v2 host, e.g.
+        https://object-store-us-east-1.anypoint.mulesoft.com. Registered
+        as an Envoy upstream cluster.
+    anypointTokenUrl:
+      type: string
+      format: service
+      default: https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token
+      description: |
+        Anypoint platform OAuth token endpoint used to mint a bearer for
+        Object Store v2 calls (separate from Salesforce credentials).
+    anypointClientId:
+      type: string
+      description: |
+        Anypoint connected-app client_id with the
+        'Use Object Store with the connected app' scope.
+    anypointClientSecret:
+      type: string
+      format: password
+      description: Anypoint connected-app client_secret.
+    anypointOrgId:
+      type: string
+      description: UUID of the Anypoint organization that owns the Object Store.
+    anypointEnvId:
+      type: string
+      description: UUID of the Anypoint environment that owns the Object Store.
+    objectStoreId:
+      type: string
+      description: |
+        Name of the Anypoint Object Store v2 store. The store must be
+        pre-created in Anypoint with the desired TTL and storage class;
+        the policy only reads/writes keys.
+    taskHotCacheTtlSeconds:
+      type: integer
+      minimum: 0
+      maximum: 3600
+      default: 60
+      description: |
+        TTL (seconds) of the per-replica PDK in-memory cache that fronts
+        Object Store v2. Acts as a latency optimizer; OS v2 is the
+        source of truth.
+    taskStoreTimeoutMs:
+      type: integer
+      minimum: 100
+      maximum: 30000
+      default: 1500
+      description: |
+        Per-call timeout for OS v2 reads/writes. On timeout, reads return
+        'not found' and writes log a warning; the RPC still succeeds.
+
+    # ---------------------------------------------------------------------
+    # Agent card configuration. Operator picks one of four sources and
+    # provides the matching field. agentCardOverrideJson is deep-merged
+    # on top of the resolved card so individual fields can be overridden.
+    # ---------------------------------------------------------------------
+    agentCardSource:
+      type: string
+      enum:
+        - inline_json
+        - url
+        - structured
+        - file
+      default: structured
+      description: |
+        How the AgentCard is supplied:
+          inline_json - paste a complete card into agentCardJson.
+          url         - fetched once at policy load from agentCardUrl.
+          structured  - common fields filled in via the structured form.
+          file        - paste the contents of agent-card.json into
+                        agentCardJson (the API Manager UI has no file
+                        upload widget; documented in home.md).
+    agentCardJson:
+      type: string
+      default: ""
+      description: |
+        Complete AgentCard JSON, used when agentCardSource is 'inline_json'
+        or 'file'. Validated at policy load time.
+    agentCardUrl:
+      type: string
+      format: service
+      description: |
+        URL the policy fetches the AgentCard JSON from. Used when
+        agentCardSource is 'url'. Registered as an Envoy upstream cluster
+        and fetched lazily on the first /.well-known/agent-card.json
+        request, then cached in memory for the life of the policy.
+        Redeploy the policy to refresh.
+    agentCardName:
+      type: string
+      default: ""
+      description: AgentCard.name (structured mode).
+    agentCardDescription:
+      type: string
+      default: ""
+      description: AgentCard.description (structured mode).
+    agentCardVersion:
+      type: string
+      default: "1.0.0"
+      description: AgentCard.version (structured mode).
+    agentCardIconUrl:
+      type: string
+      default: ""
+      description: AgentCard.iconUrl (structured mode).
+    agentCardDocumentationUrl:
+      type: string
+      default: ""
+      description: AgentCard.documentationUrl (structured mode).
+    agentCardProviderOrganization:
+      type: string
+      default: ""
+      description: AgentCard.provider.organization (structured mode).
+    agentCardProviderUrl:
+      type: string
+      default: ""
+      description: AgentCard.provider.url (structured mode).
+    agentCardCapabilitiesStreaming:
+      type: boolean
+      default: false
+      description: AgentCard.capabilities.streaming (structured mode). v1 always advertises false.
+    agentCardCapabilitiesPushNotifications:
+      type: boolean
+      default: false
+      description: AgentCard.capabilities.pushNotifications (structured mode). v1 always advertises false.
+    agentCardDefaultInputModes:
+      type: string
+      default: "text/plain"
+      description: |
+        Comma-separated AgentCard.defaultInputModes (structured mode).
+        Defaults to 'text/plain'.
+    agentCardDefaultOutputModes:
+      type: string
+      default: "text/plain"
+      description: |
+        Comma-separated AgentCard.defaultOutputModes (structured mode).
+        Defaults to 'text/plain'.
+    agentCardSkillsJson:
+      type: string
+      default: "[]"
+      description: |
+        JSON array of A2A AgentSkill objects (structured mode). Each
+        skill must include id, name, description, and tags. Validated
+        at policy load time.
+    agentCardSecuritySchemesJson:
+      type: string
+      default: ""
+      description: |
+        Optional JSON object for AgentCard.securitySchemes (structured
+        mode). Follows the OpenAPI 3.0 Security Scheme Object shape.
+    agentCardOverrideJson:
+      type: string
+      default: ""
+      description: |
+        Optional JSON object that is deep-merged on top of the
+        agent card resolved from the chosen source. Useful for
+        overriding a single field (e.g. extra securitySchemes) without
+        rewriting the whole card.
+  required:
+    - myDomainUrl
+    - agentforceApiUrl
+    - consumerKey
+    - consumerSecret
+    - agentId
+    - publicBaseUrl
+    - objectStoreBaseUrl
+    - anypointTokenUrl
+    - anypointClientId
+    - anypointClientSecret
+    - anypointOrgId
+    - anypointEnvId
+    - objectStoreId
