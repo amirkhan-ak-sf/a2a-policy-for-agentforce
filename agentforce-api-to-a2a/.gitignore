@@ -4,3 +4,5 @@ playground/config/custom-policies/*
 .pdk
 registration.yaml
 certificate.yaml
+policy-config.json
+/agentforce-api-to-a2a/policy-config.json
