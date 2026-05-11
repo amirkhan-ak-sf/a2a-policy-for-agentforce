@@ -406,7 +406,15 @@ curl -sS -X POST "$RPC" \
 
 A2A spec error `-32001 TaskNotFoundError`.
 
-#### T5 — `tasks/get` for a missing task
+#### T5 — `tasks/get`
+
+`tasks/get` has two paths: a missing task returns `-32001`, an existing task returns the
+persisted A2A `Task` JSON. The "existing" half depends on a task being readable from
+the policy's task store (either the per-replica hot cache within
+`taskHotCacheTtlSeconds`, or Anypoint Object Store v2 when `disableObjectStore: false`).
+Run T6 first to create a task, then come back to T5b.
+
+##### T5a — Missing task (negative)
 
 ```bash
 curl -sS -X POST "$RPC" \
@@ -419,6 +427,67 @@ curl -sS -X POST "$RPC" \
 ```
 
 **Expected**: same as T4 — `200` with `-32001 Task not found`.
+
+##### T5b — Existing task (positive, run after T6 / T7)
+
+Reuses `$TID` produced by T6 (and updated by T7).
+
+```bash
+curl -sS -X POST "$RPC" \
+  -H 'content-type: application/json' \
+  --data "{
+    \"jsonrpc\":\"2.0\",\"id\":3,
+    \"method\":\"tasks/get\",
+    \"params\":{ \"id\":\"$TID\" }
+  }" | jq .
+```
+
+**Expected**: `200` with the full A2A `Task` for `$TID`. Shape:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "id": "<task-id>",
+    "kind": "task",
+    "contextId": "<task-id>",
+    "status": { "state": "completed", "timestamp": "<ISO-8601>" },
+    "history": [
+      { "kind":"message", "role":"user",  "messageId":"<u-msg-id>",        "parts":[{"kind":"text","text":"<last user turn>"}],        "taskId":"<task-id>", "contextId":"<task-id>" },
+      { "kind":"message", "role":"agent", "messageId":"<agent-msg-id>",    "parts":[{"kind":"text","text":"<last agent reply>"}],      "taskId":"<task-id>", "contextId":"<task-id>" }
+    ],
+    "artifacts": [
+      { "artifactId":"agent-response-<agent-msg-id>", "name":"agent-response", "parts":[ { "kind":"text", "text":"<last agent reply>" } ] }
+    ]
+  }
+}
+```
+
+Optional — request only the last N turns with `historyLength`:
+
+```bash
+curl -sS -X POST "$RPC" \
+  -H 'content-type: application/json' \
+  --data "{
+    \"jsonrpc\":\"2.0\",\"id\":4,
+    \"method\":\"tasks/get\",
+    \"params\":{ \"id\":\"$TID\", \"historyLength\":1 }
+  }" | jq '.result.history | length'
+```
+
+Caveats:
+
+- If `disableObjectStore: true` (the current default), the task is only readable from
+  the **same gateway replica** that handled T6 / T7, and only within
+  `taskHotCacheTtlSeconds` (default 60s). A request landing on a different replica or
+  arriving later will fall back to `-32001`.
+- With `disableObjectStore: false`, `tasks/get` reads from Object Store v2 and is
+  reliable across replicas. See [`ROADMAP.md`](ROADMAP.md) #1 / #2 for the prerequisites
+  to flip that flag.
+- `result.history` only includes turns the policy persisted. With OS v2 disabled, the
+  history reflects whatever the last `message/send` on that replica stored — typically
+  the most recent two turns (user + agent).
 
 #### T6 — `message/send` (turn 1, no `taskId` → fresh Agentforce session)
 
@@ -500,7 +569,8 @@ session id under the hood.
 | T2 — malformed | `POST <RPC>` with non-JSON | `200` | `-32700 Parse error` |
 | T3 — unknown method | `POST <RPC>` with `method: "foobar/baz"` | `200` | `-32601 Method not found: foobar/baz` |
 | T4 — cancel missing | `POST <RPC>` with `tasks/cancel` for nonexistent task | `200` | `-32001 Task not found` |
-| T5 — get missing | `POST <RPC>` with `tasks/get` for nonexistent task | `200` | `-32001 Task not found` |
+| T5a — get missing | `POST <RPC>` with `tasks/get` for nonexistent task | `200` | `-32001 Task not found` |
+| T5b — get existing | `POST <RPC>` with `tasks/get` for `$TID` from T6 | `200` | Full A2A `Task` JSON (id, status, history, artifacts) |
 | T6 — fresh `message/send` | `POST <RPC>` with `message/send`, no `taskId` | `200` | A2A `Task` with one user + one agent turn |
 | T7 — same-task `message/send` | `POST <RPC>` with `message/send`, `taskId = <T6 id>` | `200` | Same `task.id`, context-aware agent reply |
 
