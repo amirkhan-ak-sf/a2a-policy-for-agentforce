@@ -331,66 +331,202 @@ anypoint-cli-v4 api-mgr policy apply <api-instance-id> agentforce-api-to-a-2-a-d
 
 ### 9. Verify the deploy
 
-Use the diagnostic ladder to confirm everything works:
+Run the test ladder below to confirm every part of the policy is wired up correctly.
+Substitute `URL` with your deployed proxy base (the value you used for `publicBaseUrl`).
+`RPC` is `URL` plus the configured `a2aRpcPath` (default `/a2a/v1/rpc`).
 
 ```bash
-URL='https://<gateway-public-host>/<api-instance-path>'
-RPC="$URL/"
-
-# Agent card (no outbound; quick liveness check)
-curl -sS "$URL/.well-known/agent-card.json" | jq '{name, url, protocolVersion, skills: (.skills|length)}'
-
-# Malformed JSON -> 200 -32700
-curl -sS -X POST "$RPC" -H 'content-type: application/json' --data 'not-json'
-
-# Unknown method -> 200 -32601
-curl -sS -X POST "$RPC" -H 'content-type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"foo/bar","params":{}}'
-
-# tasks/cancel for missing task -> 200 -32001
-curl -sS -X POST "$RPC" -H 'content-type: application/json' \
-  --data '{"jsonrpc":"2.0","id":2,"method":"tasks/cancel","params":{"id":"x"}}'
-
-# message/send -> 200 with Task containing the agent reply
-curl -sS -X POST "$RPC" -H 'content-type: application/json' --data '{
-  "jsonrpc":"2.0","id":10,
-  "method":"message/send",
-  "params":{
-    "message":{
-      "kind":"message","messageId":"u-001","role":"user",
-      "parts":[{"kind":"text","text":"hello"}]
-    }
-  }
-}'
+# Set to your deployed proxy base. No trailing slash.
+URL='https://<flex-host>/<api-instance-path>'
+RPC="$URL/a2a/v1/rpc"
 ```
 
-If any of these returns `404 Not Found` with `content-length: 0` and no `content-type`,
-that's the connected-mode WASM trap signature — see [`ROADMAP.md`](ROADMAP.md) #1 / #3.
-
-### 10. Multi-turn
-
-Take the `result.id` from the first `message/send` response and pass it as `taskId` on
-the next call. The policy reuses the same Salesforce Agentforce session and skips
-`startSession`:
+#### T1 — Agent card discovery
 
 ```bash
-TID=<result.id from previous response>
-
-curl -sS -X POST "$RPC" -H 'content-type: application/json' --data "{
-  \"jsonrpc\":\"2.0\",\"id\":11,
-  \"method\":\"message/send\",
-  \"params\":{
-    \"message\":{
-      \"kind\":\"message\",
-      \"messageId\":\"u-002\",
-      \"role\":\"user\",
-      \"taskId\":\"$TID\",
-      \"contextId\":\"$TID\",
-      \"parts\":[{\"kind\":\"text\",\"text\":\"can you check inventory for MULETEST0\"}]
-    }
-  }
-}"
+curl -sS -i "$URL/.well-known/agent-card.json" | head -5
+echo
+curl -sS "$URL/.well-known/agent-card.json" \
+  | jq '{name, protocolVersion, preferredTransport, url, skills: (.skills|length)}'
 ```
+
+**Expected**: `200 OK` with `content-type: application/json` and a body containing your
+configured agent name, `protocolVersion: "0.3.0"`, `preferredTransport: "JSONRPC"`, the
+public `url` you configured, and the count of skills you registered.
+
+#### T2 — Malformed JSON
+
+```bash
+curl -sS -X POST "$RPC" \
+  -H 'content-type: application/json' \
+  --data 'not-json-at-all'
+```
+
+**Expected**:
+
+```json
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error","data":{"reason":"<details>"}}}
+```
+
+A2A spec error `-32700 Parse error`.
+
+#### T3 — Unknown RPC method
+
+```bash
+curl -sS -X POST "$RPC" \
+  -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"foobar/baz","params":{}}'
+```
+
+**Expected**:
+
+```json
+{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found: foobar/baz"}}
+```
+
+A2A spec error `-32601 Method not found`.
+
+#### T4 — `tasks/cancel` for a missing task
+
+```bash
+curl -sS -X POST "$RPC" \
+  -H 'content-type: application/json' \
+  --data '{
+    "jsonrpc":"2.0","id":2,
+    "method":"tasks/cancel",
+    "params":{ "id":"does-not-exist" }
+  }'
+```
+
+**Expected**:
+
+```json
+{"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"Task not found","data":{"taskId":"does-not-exist"}}}
+```
+
+A2A spec error `-32001 TaskNotFoundError`.
+
+#### T5 — `tasks/get` for a missing task
+
+```bash
+curl -sS -X POST "$RPC" \
+  -H 'content-type: application/json' \
+  --data '{
+    "jsonrpc":"2.0","id":3,
+    "method":"tasks/get",
+    "params":{ "id":"does-not-exist" }
+  }'
+```
+
+**Expected**: same as T4 — `200` with `-32001 Task not found`.
+
+#### T6 — `message/send` (turn 1, no `taskId` → fresh Agentforce session)
+
+```bash
+TID=$(curl -sS -X POST "$RPC" \
+  -H 'content-type: application/json' \
+  --data '{
+    "jsonrpc":"2.0","id":10,
+    "method":"message/send",
+    "params":{
+      "message":{
+        "kind":"message",
+        "messageId":"u-001",
+        "role":"user",
+        "parts":[{"kind":"text","text":"<your-first-user-message>"}]
+      }
+    }
+  }' | tee /tmp/t6.json | jq -r .result.id)
+
+echo "task id = $TID"
+jq -r '.result.history[1].parts[0].text' /tmp/t6.json
+```
+
+**Expected**: `200` with a JSON-RPC envelope wrapping an A2A `Task`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 10,
+  "result": {
+    "id": "<task-id>",
+    "kind": "task",
+    "contextId": "<task-id>",
+    "status": { "state": "completed", "timestamp": "<ISO-8601>" },
+    "history": [
+      { "kind":"message", "role":"user",  "messageId":"u-001",          "parts":[{"kind":"text","text":"<your-first-user-message>"}], "taskId":"<task-id>", "contextId":"<task-id>" },
+      { "kind":"message", "role":"agent", "messageId":"<agent-msg-id>", "parts":[{"kind":"text","text":"<agent reply>"}],              "taskId":"<task-id>", "contextId":"<task-id>" }
+    ],
+    "artifacts": [ { "artifactId":"agent-response-<agent-msg-id>", "name":"agent-response", "parts":[...] } ]
+  }
+}
+```
+
+The `result.id` is the **task id** == the Agentforce session id. Reuse it in T7.
+
+#### T7 — `message/send` (turn 2, same `taskId` → multi-turn)
+
+```bash
+curl -sS -X POST "$RPC" \
+  -H 'content-type: application/json' \
+  --data "{
+    \"jsonrpc\":\"2.0\",\"id\":11,
+    \"method\":\"message/send\",
+    \"params\":{
+      \"message\":{
+        \"kind\":\"message\",
+        \"messageId\":\"u-002\",
+        \"role\":\"user\",
+        \"taskId\":\"$TID\",
+        \"contextId\":\"$TID\",
+        \"parts\":[{\"kind\":\"text\",\"text\":\"<your-follow-up-message>\"}]
+      }
+    }
+  }" | tee /tmp/t7.json | jq '{returned_task: .result.id, same_as_t6: (.result.id == "'"$TID"'")}'
+
+jq -r '.result.history[1].parts[0].text' /tmp/t7.json
+```
+
+**Expected**: `200` with `result.id == $TID` (the same task is reused, no new session is
+minted) and `result.history[1].parts[0].text` being a context-aware reply that depends
+on T6 (the agent remembers what was discussed). The policy reuses the Agentforce
+session id under the hood.
+
+#### Summary
+
+| Test | Method + path | Expected status | Expected body shape |
+|---|---|---|---|
+| T1 — agent card | `GET <url>/.well-known/agent-card.json` | `200` | Full `AgentCard` JSON with configured `name`, `skills`, and `url == <RPC>` |
+| T2 — malformed | `POST <RPC>` with non-JSON | `200` | `-32700 Parse error` |
+| T3 — unknown method | `POST <RPC>` with `method: "foobar/baz"` | `200` | `-32601 Method not found: foobar/baz` |
+| T4 — cancel missing | `POST <RPC>` with `tasks/cancel` for nonexistent task | `200` | `-32001 Task not found` |
+| T5 — get missing | `POST <RPC>` with `tasks/get` for nonexistent task | `200` | `-32001 Task not found` |
+| T6 — fresh `message/send` | `POST <RPC>` with `message/send`, no `taskId` | `200` | A2A `Task` with one user + one agent turn |
+| T7 — same-task `message/send` | `POST <RPC>` with `message/send`, `taskId = <T6 id>` | `200` | Same `task.id`, context-aware agent reply |
+
+#### Failure-mode reading
+
+If any test returns an unexpected response, the body usually tells you which subsystem is at fault:
+
+| Response | Cause |
+|---|---|
+| `404` + `{"error":"not_found","reason":"strictMode"}` | You hit the wrong path. The policy is alive but classified your request as passthrough. Hit `<url>/.well-known/agent-card.json` and read `.url` for the correct RPC endpoint. |
+| `404` empty body, fast (< 200ms) | Gateway-level route mismatch. The proxy path you're calling doesn't match any deployed API instance. Verify via `anypoint-cli-v4 api-mgr api list`. |
+| `404` empty body, no `content-type`, with `x-envoy-decorator-operation` | Connected-mode WASM trap. Confirm the gateway is on the release build and the policy includes the on-response refactor; see [`ROADMAP.md`](ROADMAP.md) #1 / #3. |
+| `200` `-32603 InternalError` with `data.reason = agentforce_auth_rejected` | Salesforce credentials wrong / expired / not authorized for this agent. |
+| `200` `-32603` with `data.reason = agentforce_http_error` and `status: 4xx` | Agentforce API rejected the request. Check `agentId`, the agent's user assignment, and `bypassUser`. |
+| `200` `-32603` with `data.reason = agentforce_transport_error` | Network reachability from the gateway to `api.salesforce.com` is broken. |
+
+#### Notes
+
+- Replace `<flex-host>/<api-instance-path>` with your deploy's actual URL — same value
+  as the `publicBaseUrl` you set in the policy config, and what `AgentCard.url` will
+  declare (minus the `a2aRpcPath` suffix).
+- T7 multi-turn caveat: if the gateway has multiple replicas and
+  `disableObjectStore: true`, the second request can land on a different replica whose
+  hot cache doesn't have the task. The agent reply still works (Salesforce keeps session
+  state), but the policy-returned `Task` may only contain the second turn's history.
+  Enable OS v2 (see [`ROADMAP.md`](ROADMAP.md) #1 / #2) for cross-replica persistence.
 
 
 ## Make command reference
