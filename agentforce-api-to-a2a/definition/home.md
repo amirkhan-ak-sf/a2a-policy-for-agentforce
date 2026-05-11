@@ -50,9 +50,34 @@ follow-on reads. Writes are best-effort - a transient OS v2 outage logs
 a warning and lets the RPC succeed; subsequent `tasks/get` against that
 task will simply return `TaskNotFoundError -32001`.
 
-The operator must pre-create the Object Store v2 store in Anypoint with
-the desired TTL (the policy does not create stores; it only reads/writes
-keys).
+When `autoCreateStore` is `true` (the default), the policy POSTs to the
+Anypoint OS v2 admin endpoint on first use to materialize the store if
+it does not yet exist. The connected app supplied via `anypointClientId`
+must have the **Use Object Store with the connected app** scope, plus
+**Object Store Admin** when `autoCreateStore` is on. Set
+`autoCreateStore: false` if you would rather pre-create the store
+yourself.
+
+Set `disableObjectStore: true` as an escape hatch when OS v2 is
+unhealthy; the policy will keep serving the A2A surface using only the
+per-replica in-memory hot cache. Tasks become non-durable in that mode
+(`tasks/get` for tasks written on a different replica returns
+`TaskNotFoundError -32001`), but `message/send` keeps working.
+
+## How outbound calls are dispatched (`on_request` + `on_response`)
+
+For requests that route to `message/send`, the policy reads the inbound
+body in `on_request` and returns `Flow::Continue`, then performs all
+Salesforce / Agentforce / OS v2 calls in `on_response` and replaces the
+upstream's response with the policy-built A2A `Task` JSON. The other
+methods (`tasks/get`, `tasks/cancel`, malformed JSON, unknown method,
+agent-card discovery) short-circuit synchronously in `on_request`.
+
+This split exists because, on some connected-mode Flex Gateway runtime
+versions, outbound HTTPS calls issued from a PDK WASM filter *after*
+the request body has been read cause the filter to trap. Issuing them
+from the response phase routes around the issue. No operator action is
+required; the architecture is internal.
 
 ## Agent card configuration
 
@@ -156,14 +181,19 @@ agentCardOverrideJson: |
 
 ## Quick start: hit the API
 
-After deploying, your operator-supplied URL exposes the A2A surface:
+After deploying, your operator-supplied URL exposes the A2A surface.
+`<base>` here is the proxy path you configured for the API instance
+(e.g. `https://your-flex.example.com/agentforce-a2a`). `<rpc>` is
+`<base>` plus `a2aRpcPath` (default `/a2a/v1/rpc`); A2A clients pick
+this up automatically from `AgentCard.url`.
 
 ```bash
-# 1. Discover the agent.
-curl https://your-flex.example.com/agentforce/.well-known/agent-card.json
+# 1. Discover the agent. A2A clients read `AgentCard.url` from this
+#    response and POST follow-up RPC requests there.
+curl https://your-flex.example.com/agentforce-a2a/.well-known/agent-card.json
 
 # 2. Send a message (no taskId yet -> a fresh Agentforce session is started).
-curl https://your-flex.example.com/agentforce/ \
+curl https://your-flex.example.com/agentforce-a2a/a2a/v1/rpc \
   -H 'content-type: application/json' \
   -d '{
     "jsonrpc": "2.0",
@@ -179,24 +209,48 @@ curl https://your-flex.example.com/agentforce/ \
     }
   }'
 
-# 3. Retrieve the resulting Task by id (== Agentforce sessionId).
-curl https://your-flex.example.com/agentforce/ \
+# 3. Continue the conversation. Take `result.id` from the previous
+#    response and pass it back as `taskId` (and optionally `contextId`).
+#    The policy reuses the same Agentforce session and skips startSession,
+#    so the agent's reply is context-aware.
+curl https://your-flex.example.com/agentforce-a2a/a2a/v1/rpc \
   -H 'content-type: application/json' \
   -d '{
     "jsonrpc": "2.0",
     "id": 2,
-    "method": "tasks/get",
-    "params": { "id": "abc-123" }
+    "method": "message/send",
+    "params": {
+      "message": {
+        "kind": "message",
+        "messageId": "u-002",
+        "role": "user",
+        "taskId": "<previous result.id>",
+        "contextId": "<previous result.id>",
+        "parts": [{"kind":"text","text":"check inventory for MULETEST0"}]
+      }
+    }
   }'
 
-# 4. Cancel the conversation (calls Agentforce endSession).
-curl https://your-flex.example.com/agentforce/ \
+# 4. Retrieve the persisted Task by id (== Agentforce sessionId).
+#    Requires `disableObjectStore: false` so the policy can read it
+#    back from OS v2.
+curl https://your-flex.example.com/agentforce-a2a/a2a/v1/rpc \
   -H 'content-type: application/json' \
   -d '{
     "jsonrpc": "2.0",
     "id": 3,
+    "method": "tasks/get",
+    "params": { "id": "<previous result.id>" }
+  }'
+
+# 5. Cancel the conversation (calls Agentforce endSession).
+curl https://your-flex.example.com/agentforce-a2a/a2a/v1/rpc \
+  -H 'content-type: application/json' \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 4,
     "method": "tasks/cancel",
-    "params": { "id": "abc-123" }
+    "params": { "id": "<previous result.id>" }
   }'
 ```
 
@@ -205,9 +259,11 @@ curl https://your-flex.example.com/agentforce/ \
 | Field | Required | Default | Description |
 |---|---|---|---|
 | `myDomainUrl` | yes | — | Salesforce My Domain URL. The OAuth `/services/oauth2/token` endpoint is reached at `<myDomainUrl>/services/oauth2/token`. |
-| `agentforceApiUrl` | yes | `https://api.salesforce.com/einstein/ai-agent/v1` | Base URL of the Agentforce Agents API. |
+| `agentforceApiUrl` | yes | `https://api.salesforce.com` | Host-only base URL of the Agentforce Agents API. Registered as an Envoy upstream cluster, so it must be host-only (no path). |
+| `agentforceApiBasePath` | no | `/einstein/ai-agent/v1` | Path prefix prepended to every Agentforce REST call (combined with `agentforceApiUrl`). |
 | `consumerKey` | yes | — | External Connected App OAuth `client_id`. |
 | `consumerSecret` | yes | — | External Connected App OAuth `client_secret`. Reference via Anypoint Secrets Manager. |
+| `agentforceAccessTokenOverride` | no | — | Diagnostic override. When set, the policy skips the Salesforce OAuth exchange and uses this bearer for Agentforce calls. Leave blank in production. |
 | `agentId` | yes | — | Agentforce agent id used in `POST /agents/{id}/sessions`. |
 | `bypassUser` | no | `true` | Use the agent-assigned user (correct for `client_credentials`). |
 | `cacheSafetyMarginSeconds` | no | `60` | Refresh tokens this many seconds before `expires_in`. |
@@ -221,7 +277,10 @@ curl https://your-flex.example.com/agentforce/ \
 | `anypointClientSecret` | yes | — | Anypoint connected-app client secret. |
 | `anypointOrgId` | yes | — | Anypoint organization UUID. |
 | `anypointEnvId` | yes | — | Anypoint environment UUID. |
-| `objectStoreId` | yes | — | Pre-created OS v2 store name. |
+| `objectStoreId` | yes | — | OS v2 store name. |
+| `autoCreateStore` | no | `true` | When true, the policy creates the OS v2 store on first use if it doesn't exist. Requires *Object Store Admin* scope on the connected app. |
+| `disableObjectStore` | no | `false` | Escape hatch. When true, the policy keeps tasks only in the per-replica in-memory hot cache (no OS v2 calls). |
+| `objectStoreTtlSeconds` | no | `86400` | TTL applied when the policy creates the OS v2 store. Ignored if the store already exists. |
 | `taskHotCacheTtlSeconds` | no | `60` | TTL of the per-replica PDK hot cache in front of OS v2. |
 | `taskStoreTimeoutMs` | no | `1500` | Per-call timeout for OS v2 reads/writes. |
 | `agentCardSource` | no | `structured` | `inline_json` \| `url` \| `structured` \| `file`. |

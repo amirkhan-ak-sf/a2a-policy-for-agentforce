@@ -67,7 +67,13 @@ release: build ## Publish a release version
 
 GROUP_ID                = $(shell cargo anypoint get-group-id)
 ASSET_VERSION           = $(shell cargo anypoint get-version)
-ASSET_ID                = $(shell echo "$(CRATE_NAME)" | tr _ -)
+# Prefer the explicit `definition_asset_id` from Cargo.toml's
+# [package.metadata.anypoint] block; only fall back to the underscores-to-
+# hyphens transform of the crate name when no override is set. Anypoint
+# Exchange asset id rules forbid hyphen-separated segments that mix
+# letters and digits, so policies like ours encode `a2a` as `a-2-a`,
+# which the simple `tr _ -` heuristic doesn't capture.
+ASSET_ID                = $(shell cargo anypoint get-anypoint-metadata | python3 -c 'import sys,json; m=json.load(sys.stdin); print(m.get("definition-asset-id") or (m.get("package_name") or "").replace("_","-"))')
 DEFINITION_GAV          = $(GROUP_ID)/$(ASSET_ID)/$(ASSET_VERSION)
 HOME_MD                 = definition/home.md
 

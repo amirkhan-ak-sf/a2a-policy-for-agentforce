@@ -335,7 +335,7 @@ Use the diagnostic ladder to confirm everything works:
 
 ```bash
 URL='https://<gateway-public-host>/<api-instance-path>'
-RPC="$URL/a2a/v1/rpc"
+RPC="$URL/"
 
 # Agent card (no outbound; quick liveness check)
 curl -sS "$URL/.well-known/agent-card.json" | jq '{name, url, protocolVersion, skills: (.skills|length)}'
