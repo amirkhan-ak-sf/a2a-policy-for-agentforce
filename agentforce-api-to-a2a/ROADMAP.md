@@ -24,14 +24,6 @@ Verify in this order:
 2. The OS v2 host (`objectStoreBaseUrl`) is reachable from the gateway. (We saw `flex-gateway-agent` log `Error authorizing object storage … status: 503/504` in one private space; that needs to clear before flipping the flag.)
 3. Run the smoke ladder (see `README.md` "Verifying the deploy") with `tasks/get` against a freshly created task.
 
-### 3. File MuleSoft support ticket for the body-state outbound trap
-
-The connected-mode Flex Gateway WASM filter traps when an outbound HTTPS call is issued **after** `request.into_body_state().await`. We have a clean reproducer (the policy works end-to-end on `mulesoft/flex-gateway:latest` in `--mode=local` and fails identically on CloudHub managed Flex 1.12.5 and self-managed Flex 1.13.0 in connected mode). The on-response workaround unblocks production, but the underlying runtime issue should be reported so future PDK policies aren't forced into the same architectural detour.
-
-Reference correlation IDs from this session:
-- Pre-fix CloudHub failure: `ec4574e2-12ef-4570-b8b7-affde52a05fe` and `f4e98859-a36f-430a-a355-2eaac0a9dd77`.
-- Diag-A2 confirmation that the same outbound succeeds in `RequestHeadersState`: log timestamp `2026-05-08T20:01:56.094Z` (`a2a-trace: diag-A2 agentforce-probe ok session_id_len=36`), then traps after `into_body_state().await`.
-
 ## P1 — A2A protocol completeness
 
 ### 4. Salesforce session expiry handling
