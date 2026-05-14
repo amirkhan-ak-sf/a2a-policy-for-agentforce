@@ -1,9 +1,8 @@
-//! Persistent task storage.
+//! Task state storage.
 //!
-//! `object_store_v2` talks to Anypoint Object Store v2 (the persistent
-//! source of truth) and `task_store` is the read-through / write-through
-//! wrapper that fronts OS v2 with the PDK shared cache for low-latency
-//! repeat reads.
+//! `task_store` is currently backed by the per-replica PDK shared cache
+//! only. Anypoint Object Store v2 persistence has been removed for now;
+//! tasks live for `taskHotCacheTtlSeconds` and disappear on policy
+//! reload or replica replacement.
 
-pub mod object_store_v2;
 pub mod task_store;

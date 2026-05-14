@@ -3,15 +3,14 @@
 //! The Flex Gateway worker-shared cache (see `pdk::cache::Cache`) is used as
 //! the hot path for two unrelated workloads:
 //!
-//!   1. OAuth access tokens for Salesforce and for the Anypoint platform.
-//!      Lifecycle is short (minutes), per-replica is fine, OS v2 is not
-//!      consulted.
-//!   2. The `TaskStore` hot layer that fronts Anypoint Object Store v2 (in
-//!      `crate::store::task_store`). Lifecycle is short on purpose; OS v2
-//!      is the source of truth.
+//!   1. Salesforce/Agentforce OAuth access tokens. Lifecycle is short
+//!      (minutes), per-replica is fine.
+//!   2. The in-memory `TaskStore` (see `crate::store::task_store`).
+//!      Lifecycle is short on purpose; tasks are not persisted across
+//!      replica restarts.
 //!
 //! This module owns the cache key derivation for tokens and the shared
-//! `CachedToken` shape so the two token cache paths stay symmetric.
+//! `CachedToken` shape.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -49,10 +48,6 @@ impl CachedToken {
 
 /// Cache key prefix used by the Salesforce/Agentforce OAuth client.
 pub const AGENTFORCE_TOKEN_PREFIX: &str = "agentforce-tokens";
-
-/// Cache key prefix used by the Anypoint platform OAuth client (for OS v2
-/// access).
-pub const ANYPOINT_TOKEN_PREFIX: &str = "anypoint-os2";
 
 /// Build a stable cache key from `(prefix, client_id, base_url)`.
 ///
@@ -92,13 +87,6 @@ mod tests {
     fn key_does_not_leak_client_id() {
         let k = token_cache_key(AGENTFORCE_TOKEN_PREFIX, "secret-client-id", "https://x");
         assert!(!k.contains("secret-client-id"));
-    }
-
-    #[test]
-    fn agentforce_and_anypoint_keys_diverge() {
-        let a = token_cache_key(AGENTFORCE_TOKEN_PREFIX, "id", "https://x");
-        let b = token_cache_key(ANYPOINT_TOKEN_PREFIX, "id", "https://x");
-        assert_ne!(a, b);
     }
 
     #[test]
