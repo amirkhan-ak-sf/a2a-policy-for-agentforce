@@ -200,6 +200,40 @@ pub async fn publish_agent_card(
     let _ = card_description; // not accepted by Exchange agent type — keep var to avoid unused warnings
     let bearer = format!("Bearer {token}");
 
+    // 3b. Tier 2 idempotency: compute SHA-256 of the resolved card and
+    //     check Exchange's existing versions. If any version in this
+    //     asset's minor stream already carries the same `a2a-card` file
+    //     SHA-256, the card hasn't meaningfully changed since the last
+    //     publish — skip the POST entirely. This survives pod restarts
+    //     and scale-out (every replica asks Exchange directly), so we
+    //     don't churn versions when nothing has changed.
+    let card_sha256 = sha256_hex(card_bytes);
+    match find_existing_version_with_card(client, &ctx, &bearer, &base_version, &card_sha256).await
+    {
+        Ok(Some(existing_version)) => {
+            logger::info!(
+                "exchange-publish: skipping POST — v{existing_version} of {}/{} already carries this card content (sha256={}…)",
+                ctx.publish_cfg.group_id,
+                ctx.publish_cfg.asset_id,
+                &card_sha256[..12]
+            );
+            return Ok(());
+        }
+        Ok(None) => {
+            logger::debug!(
+                "exchange-publish: no existing version matches card sha256={}…; will POST",
+                &card_sha256[..12]
+            );
+        }
+        Err(e) => {
+            // Lookup failed — degrade to publish-anyway. Auto-bump path
+            // still saves us from collisions.
+            logger::warn!(
+                "exchange-publish: content-check lookup failed: {e}; falling through to POST"
+            );
+        }
+    }
+
     // 4. First attempt at base_version.
     let outcome = post_version(client, &ctx, &bearer, &card_name, &base_version, card_bytes).await?;
     match outcome {
@@ -339,19 +373,82 @@ async fn post_version(
     }
 }
 
-/// GET the asset's existing minor-version stream and pick the next free
-/// patch above any returned version. Falls back to bumping the operator's
-/// patch by 1 if the response is unparseable.
-async fn next_free_patch(
+/// GET the asset's existing minor-version stream and look for a version
+/// whose `a2a-card` json file's SHA-256 matches the current card. Returns
+/// `Some(version)` when found, `None` when not, and `Err` when the lookup
+/// itself failed (caller falls through to publish anyway).
+async fn find_existing_version_with_card(
     client: &HttpClient,
     ctx: &PublishContext<'_>,
     bearer: &str,
     base_version: &str,
-) -> Result<String, PublishError> {
-    let (major, minor, patch) = match parse_semver(base_version) {
-        Some(v) => v,
-        None => return Ok(format!("{base_version}-1")),
-    };
+    card_sha256_hex: &str,
+) -> Result<Option<String>, PublishError> {
+    let v = fetch_minor_versions(client, ctx, bearer, base_version).await?;
+    Ok(find_card_match(&v, card_sha256_hex))
+}
+
+/// Walk the minorVersions response and return the first version whose
+/// `files[]` carries an `a2a-card` / `json` entry with a matching sha256.
+///
+/// The shape (per the Exchange UI capture) puts versions both at the top
+/// level and inside a `versions[]` array, with `otherVersions[]` for
+/// historical entries. We check all of them.
+fn find_card_match(v: &Value, card_sha256_hex: &str) -> Option<String> {
+    let needle = card_sha256_hex.to_ascii_lowercase();
+    if let Some(version) = match_in_node(v, &needle) {
+        return Some(version);
+    }
+    if let Some(arr) = v.get("versions").and_then(Value::as_array) {
+        for item in arr {
+            if let Some(version) = match_in_node(item, &needle) {
+                return Some(version);
+            }
+        }
+    }
+    if let Some(arr) = v.get("otherVersions").and_then(Value::as_array) {
+        for item in arr {
+            if let Some(version) = match_in_node(item, &needle) {
+                return Some(version);
+            }
+        }
+    }
+    None
+}
+
+/// Check a single version-shaped node for a matching a2a-card file. Returns
+/// the node's `version` string if any `files[]` entry has classifier
+/// `a2a-card`, packaging `json`, and the given sha256.
+fn match_in_node(node: &Value, needle_lc: &str) -> Option<String> {
+    let files = node.get("files").and_then(Value::as_array)?;
+    let matches = files.iter().any(|f| {
+        let classifier = f.get("classifier").and_then(Value::as_str).unwrap_or("");
+        let packaging = f.get("packaging").and_then(Value::as_str).unwrap_or("");
+        let sha = f.get("sha256").and_then(Value::as_str).unwrap_or("");
+        classifier == "a2a-card" && packaging == "json" && sha.eq_ignore_ascii_case(needle_lc)
+    });
+    if matches {
+        node.get("version")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    } else {
+        None
+    }
+}
+
+/// Shared GET against the minor-version stream. Used by both the
+/// content-equality check and the next-free-patch helper.
+async fn fetch_minor_versions(
+    client: &HttpClient,
+    ctx: &PublishContext<'_>,
+    bearer: &str,
+    base_version: &str,
+) -> Result<Value, PublishError> {
+    let (major, minor, _patch) = parse_semver(base_version)
+        .ok_or_else(|| PublishError::PublishHttpStatus {
+            status: 0,
+            body: format!("base version '{base_version}' is not strict semver"),
+        })?;
     let minor_stream = format!("{major}.{minor}");
 
     let path = format!(
@@ -361,7 +458,7 @@ async fn next_free_patch(
         urlencoding::encode(&minor_stream),
     );
 
-    logger::info!("exchange-publish: GET {path} (enumerate versions)");
+    logger::info!("exchange-publish: GET {path}");
 
     let response = client
         .request(ctx.exchange_service)
@@ -376,6 +473,11 @@ async fn next_free_patch(
         .map_err(|e| PublishError::PublishTransport(e.to_string()))?;
 
     let status = response.status_code();
+    if status == 404 {
+        // No versions yet in this minor stream — return an empty object
+        // so callers see "no matches".
+        return Ok(serde_json::json!({}));
+    }
     if !(200..300).contains(&status) {
         let body_str = String::from_utf8_lossy(response.body());
         return Err(PublishError::PublishHttpStatus {
@@ -384,14 +486,27 @@ async fn next_free_patch(
         });
     }
 
-    let v: Value = serde_json::from_slice(response.body())
-        .map_err(|e| PublishError::PublishHttpStatus {
-            status: 0,
-            body: format!("minorVersions response not JSON: {e}"),
-        })?;
+    serde_json::from_slice(response.body()).map_err(|e| PublishError::PublishHttpStatus {
+        status: 0,
+        body: format!("minorVersions response not JSON: {e}"),
+    })
+}
 
-    // Collect every patch number in the same major.minor stream from
-    // both `version` and the `versions[]` / `otherVersions[]` arrays.
+/// GET the asset's existing minor-version stream and pick the next free
+/// patch above any returned version. Falls back to bumping the operator's
+/// patch by 1 if the version is unparseable.
+async fn next_free_patch(
+    client: &HttpClient,
+    ctx: &PublishContext<'_>,
+    bearer: &str,
+    base_version: &str,
+) -> Result<String, PublishError> {
+    let (major, minor, patch) = match parse_semver(base_version) {
+        Some(v) => v,
+        None => return Ok(format!("{base_version}-1")),
+    };
+    let v = fetch_minor_versions(client, ctx, bearer, base_version).await?;
+
     let mut max_patch = patch;
     collect_patches(&v, major, minor, &mut max_patch);
     if let Some(arr) = v.get("versions").and_then(Value::as_array) {
@@ -434,11 +549,17 @@ fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
 }
 
 fn sha256_short(bytes: &[u8]) -> String {
+    let hex = sha256_hex(bytes);
+    hex[..8].to_string()
+}
+
+/// Full 64-char hex SHA-256, matching the format Exchange uses on
+/// `files[].sha256`.
+fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     let digest = h.finalize();
-    let hex = format!("{digest:x}");
-    hex[..8].to_string()
+    format!("{digest:x}")
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -501,5 +622,56 @@ mod tests {
         let mut max = 0u32;
         collect_patches(&v, 1, 0, &mut max);
         assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn sha256_hex_is_full_64_chars() {
+        let h = sha256_hex(b"hello");
+        assert_eq!(h.len(), 64);
+        assert_eq!(
+            h,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[test]
+    fn match_in_node_finds_a2a_card_json_by_sha() {
+        let v = serde_json::json!({
+            "version": "1.0.7",
+            "files": [
+                {"classifier": "a2a-card", "packaging": "zip", "sha256": "deadbeef"},
+                {"classifier": "a2a-card", "packaging": "json", "sha256": "ABC123"},
+                {"classifier": "agent-metadata", "packaging": "json", "sha256": "feedface"},
+            ],
+        });
+        assert_eq!(match_in_node(&v, "abc123"), Some("1.0.7".to_string()));
+    }
+
+    #[test]
+    fn match_in_node_skips_when_no_a2a_card_json() {
+        let v = serde_json::json!({
+            "version": "1.0.7",
+            "files": [
+                {"classifier": "agent-metadata", "packaging": "json", "sha256": "abc123"},
+            ],
+        });
+        assert!(match_in_node(&v, "abc123").is_none());
+    }
+
+    #[test]
+    fn find_card_match_walks_versions_array() {
+        let v = serde_json::json!({
+            "version": "1.0.5",
+            "files": [{"classifier": "a2a-card", "packaging": "json", "sha256": "aaa"}],
+            "versions": [
+                {
+                    "version": "1.0.7",
+                    "files": [{"classifier": "a2a-card", "packaging": "json", "sha256": "bbb"}],
+                }
+            ]
+        });
+        assert_eq!(find_card_match(&v, "bbb"), Some("1.0.7".to_string()));
+        assert_eq!(find_card_match(&v, "aaa"), Some("1.0.5".to_string()));
+        assert_eq!(find_card_match(&v, "ccc"), None);
     }
 }
