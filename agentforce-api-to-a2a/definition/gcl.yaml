@@ -274,6 +274,73 @@ spec:
         overriding a single field (e.g. extra securitySchemes) without
         rewriting the whole card.
 
+    # ---------------------------------------------------------------------
+    # Anypoint Exchange asset publication (opt-in)
+    # ---------------------------------------------------------------------
+    # When enabled, the resolved agent-card.json is published as a new
+    # version of an existing Exchange `agent` asset on the first request
+    # that lands on each replica after policy load. Failures log at warn
+    # and never block traffic. See docs/operator-runbook for setup.
+    publishAgentCardToExchange:
+      type: boolean
+      default: false
+      description: |
+        When true, the policy POSTs the resolved agent-card.json to the
+        Exchange asset identified by `exchangeAssetGroupId` /
+        `exchangeAssetId` on the first inbound request after policy load.
+        The version published is `<agentCardVersion>-<sha256-prefix>` so
+        re-applying the same config is idempotent (Exchange returns 409
+        on a repeat and the policy treats it as success).
+    exchangeBaseUrl:
+      type: string
+      format: service
+      default: https://anypoint.mulesoft.com
+      description: |
+        Anypoint Exchange host. Registered as an Envoy upstream cluster.
+        Override only for EU / sovereign cloud or air-gapped tenants.
+    anypointTokenUrl:
+      type: string
+      format: service
+      default: https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token
+      description: |
+        Anypoint platform OAuth token endpoint used to mint the bearer
+        for the Exchange publish call.
+    anypointClientId:
+      type: string
+      default: ""
+      description: |
+        Connected-app client_id with the `Exchange Contributor` role on
+        the target asset. Required when `publishAgentCardToExchange` is
+        true.
+    anypointClientSecret:
+      type: string
+      format: password
+      default: ""
+      description: |
+        Connected-app client_secret matching `anypointClientId`. Required
+        when `publishAgentCardToExchange` is true.
+    anypointOrgId:
+      type: string
+      default: ""
+      description: |
+        UUID of the Anypoint organization that owns the Exchange asset.
+        Required when `publishAgentCardToExchange` is true.
+    exchangeAssetGroupId:
+      type: string
+      default: ""
+      description: |
+        groupId of the existing Exchange agent asset. Leave blank to use
+        `anypointOrgId` (Exchange uses the org UUID as the groupId for
+        org-private assets, the common case).
+    exchangeAssetId:
+      type: string
+      default: ""
+      description: |
+        assetId of the existing Exchange `agent` asset (e.g.
+        "sales-order-mgmt"). The asset must already exist; the policy
+        adds a new version per apply. Required when
+        `publishAgentCardToExchange` is true.
+
     diagnosticPreBodyProbe:
       type: boolean
       default: false

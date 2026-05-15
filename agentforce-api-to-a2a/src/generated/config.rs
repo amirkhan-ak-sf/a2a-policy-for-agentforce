@@ -63,6 +63,18 @@ pub struct Config {
         deserialize_with = "pdk::serde::deserialize_service"
     )]
     pub agentforce_api_url: pdk::hl::Service,
+    #[serde(alias = "anypointClientId")]
+    pub anypoint_client_id: Option<String>,
+    #[serde(alias = "anypointClientSecret")]
+    pub anypoint_client_secret: Option<String>,
+    #[serde(alias = "anypointOrgId")]
+    pub anypoint_org_id: Option<String>,
+    #[serde(
+        alias = "anypointTokenUrl",
+        default,
+        deserialize_with = "pdk::serde::deserialize_service_opt"
+    )]
+    pub anypoint_token_url: Option<pdk::hl::Service>,
     #[serde(alias = "bypassUser")]
     pub bypass_user: Option<bool>,
     #[serde(alias = "cacheSafetyMarginSeconds")]
@@ -77,12 +89,24 @@ pub struct Config {
     pub diagnostic_pre_body_agentforce_probe: Option<bool>,
     #[serde(alias = "diagnosticPreBodyProbe")]
     pub diagnostic_pre_body_probe: Option<bool>,
+    #[serde(alias = "exchangeAssetGroupId")]
+    pub exchange_asset_group_id: Option<String>,
+    #[serde(alias = "exchangeAssetId")]
+    pub exchange_asset_id: Option<String>,
+    #[serde(
+        alias = "exchangeBaseUrl",
+        default,
+        deserialize_with = "pdk::serde::deserialize_service_opt"
+    )]
+    pub exchange_base_url: Option<pdk::hl::Service>,
     #[serde(alias = "myDomainUrl", deserialize_with = "pdk::serde::deserialize_service")]
     pub my_domain_url: pdk::hl::Service,
     #[serde(alias = "protocolVersion")]
     pub protocol_version: Option<String>,
     #[serde(alias = "publicBaseUrl")]
     pub public_base_url: String,
+    #[serde(alias = "publishAgentCardToExchange")]
+    pub publish_agent_card_to_exchange: Option<bool>,
     #[serde(alias = "strictMode")]
     pub strict_mode: Option<bool>,
     #[serde(alias = "taskHotCacheTtlSeconds")]
@@ -102,6 +126,14 @@ fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {
         abi.service_create(service)?;
     }
     abi.service_create(config.agentforce_api_url)?;
+    if config.anypoint_token_url.is_some() {
+        let service = config.anypoint_token_url.unwrap();
+        abi.service_create(service)?;
+    }
+    if config.exchange_base_url.is_some() {
+        let service = config.exchange_base_url.unwrap();
+        abi.service_create(service)?;
+    }
     abi.service_create(config.my_domain_url)?;
     abi.setup()?;
     Ok(())

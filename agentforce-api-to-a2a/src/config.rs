@@ -99,6 +99,20 @@ impl AgentCardSource {
     }
 }
 
+/// Resolved Exchange-publish settings. Only present when
+/// `publishAgentCardToExchange = true` AND the required fields are set.
+/// If the toggle is on but credentials/asset id are missing, this stays
+/// `None` and the policy logs a warn at first request — never blocks
+/// policy load.
+#[derive(Debug, Clone)]
+pub struct ExchangePublishConfig {
+    pub anypoint_client_id: String,
+    pub anypoint_client_secret: String,
+    pub anypoint_org_id: String,
+    pub group_id: String,
+    pub asset_id: String,
+}
+
 /// One row of the `agentCardSkills` array as supplied by the operator.
 /// Decoupled from the codegen-generated struct so unit tests don't need
 /// the PDK runtime.
@@ -155,6 +169,9 @@ pub struct PolicyConfig {
     pub structured_card: StructuredCardConfig,
     pub agent_card_override: Option<serde_json::Value>,
 
+    // Exchange publish: Some when toggle is on AND required fields are set.
+    pub exchange_publish: Option<ExchangePublishConfig>,
+
     // Diagnostic flags. Used to A/B test the connected-mode WASM trap
     // hypothesis. Both default to false in production.
     pub diagnostic_pre_body_probe: bool,
@@ -203,6 +220,13 @@ pub struct RawConfig {
     pub agent_card_skills: Vec<SkillInput>,
     pub agent_card_security_schemes_json: Option<String>,
     pub agent_card_override_json: Option<String>,
+
+    pub publish_agent_card_to_exchange: Option<bool>,
+    pub anypoint_client_id: Option<String>,
+    pub anypoint_client_secret: Option<String>,
+    pub anypoint_org_id: Option<String>,
+    pub exchange_asset_group_id: Option<String>,
+    pub exchange_asset_id: Option<String>,
 
     pub diagnostic_pre_body_probe: Option<bool>,
     pub diagnostic_pre_body_agentforce_probe: Option<bool>,
@@ -271,6 +295,33 @@ impl PolicyConfig {
             ConfigError::AgentCardOverrideNotObject,
         )?;
 
+        // Best-effort resolution of the Exchange-publish settings. If the
+        // operator turned on the toggle but didn't fill in the required
+        // fields, we log at warn (in lib.rs) and skip the publish — never
+        // refuse policy load. Refusing would fault every request.
+        let exchange_publish = if raw.publish_agent_card_to_exchange.unwrap_or(false) {
+            let cid = nonempty_opt(raw.anypoint_client_id.clone());
+            let csec = nonempty_opt(raw.anypoint_client_secret.clone());
+            let org = nonempty_opt(raw.anypoint_org_id.clone());
+            let asset_id = nonempty_opt(raw.exchange_asset_id.clone());
+            match (cid, csec, org, asset_id) {
+                (Some(cid), Some(csec), Some(org), Some(asset_id)) => {
+                    let group_id = nonempty_opt(raw.exchange_asset_group_id.clone())
+                        .unwrap_or_else(|| org.clone());
+                    Some(ExchangePublishConfig {
+                        anypoint_client_id: cid,
+                        anypoint_client_secret: csec,
+                        anypoint_org_id: org,
+                        group_id,
+                        asset_id,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             consumer_key,
             consumer_secret,
@@ -290,6 +341,8 @@ impl PolicyConfig {
             agent_card_json,
             structured_card,
             agent_card_override,
+
+            exchange_publish,
 
             diagnostic_pre_body_probe: raw.diagnostic_pre_body_probe.unwrap_or(false),
             diagnostic_pre_body_agentforce_probe: raw

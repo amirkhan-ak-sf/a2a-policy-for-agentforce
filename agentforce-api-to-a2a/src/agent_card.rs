@@ -231,6 +231,13 @@ impl CardProvider {
         Ok(())
     }
 
+    /// Return the prebuilt card bytes if `warm()` has populated them
+    /// (i.e. for non-URL sources). Returns `None` for URL sources whose
+    /// card has not yet been fetched.
+    pub fn warmed_bytes(&self) -> Option<Rc<Vec<u8>>> {
+        self.prebuilt_bytes.borrow().clone()
+    }
+
     /// Return the AgentCard JSON bytes ready to write to the wire.
     pub async fn bytes(&self, http: &HttpClient, now_unix: u64) -> Result<Rc<Vec<u8>>, CardError> {
         if let Some(b) = self.prebuilt_bytes.borrow().as_ref() {
@@ -341,6 +348,7 @@ mod tests {
             task_hot_cache_ttl_seconds: 60,
             agent_card_source: source,
             agent_card_json: json,
+            exchange_publish: None,
             structured_card: StructuredCardConfig {
                 name: Some("Hello Agent".into()),
                 description: Some("desc".into()),
