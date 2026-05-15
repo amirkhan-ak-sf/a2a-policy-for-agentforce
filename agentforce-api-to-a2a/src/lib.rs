@@ -39,6 +39,7 @@ mod agent_card;
 mod agentforce;
 mod cache;
 mod config;
+mod exchange;
 mod generated;
 mod jsonrpc;
 mod router;
@@ -60,12 +61,10 @@ use crate::config::{PolicyConfig, RawConfig};
 use crate::generated::config::Config;
 use crate::jsonrpc::{JsonRpcError, INVALID_REQUEST, METHOD_NOT_FOUND};
 use crate::router::{classify, Route};
-use crate::store::object_store_v2::{OS2Config, ObjectStoreV2};
 use crate::store::task_store::TaskStore;
 
-/// Cache id for the worker-shared PDK cache. Stores OAuth tokens
-/// (Salesforce + Anypoint), the URL-fetched AgentCard, and the hot layer
-/// of the TaskStore.
+/// Cache id for the worker-shared PDK cache. Stores the Salesforce
+/// OAuth token, the URL-fetched AgentCard, and the in-memory TaskStore.
 const CACHE_ID: &str = "agentforce-a2a-shared";
 
 fn now_unix() -> u64 {
@@ -141,16 +140,7 @@ impl From<&Config> for RawConfig {
             a2a_rpc_path: c.a_2_a_rpc_path.clone(),
             public_base_url: Some(c.public_base_url.clone()),
             strict_mode: c.strict_mode,
-            anypoint_client_id: Some(c.anypoint_client_id.clone()),
-            anypoint_client_secret: Some(c.anypoint_client_secret.clone()),
-            anypoint_org_id: Some(c.anypoint_org_id.clone()),
-            anypoint_env_id: Some(c.anypoint_env_id.clone()),
-            object_store_id: Some(c.object_store_id.clone()),
-            auto_create_store: c.auto_create_store,
-            disable_object_store: c.disable_object_store,
-            object_store_ttl_seconds: c.object_store_ttl_seconds,
             task_hot_cache_ttl_seconds: c.task_hot_cache_ttl_seconds,
-            task_store_timeout_ms: c.task_store_timeout_ms,
             agent_card_source: c.agent_card_source.clone(),
             agent_card_json: c.agent_card_json.clone(),
             agent_card_url_registered: c.agent_card_url.is_some(),
@@ -165,9 +155,27 @@ impl From<&Config> for RawConfig {
             agent_card_capabilities_push_notifications: c.agent_card_capabilities_push_notifications,
             agent_card_default_input_modes: c.agent_card_default_input_modes.clone(),
             agent_card_default_output_modes: c.agent_card_default_output_modes.clone(),
-            agent_card_skills_json: c.agent_card_skills_json.clone(),
+            agent_card_skills: c
+                .agent_card_skills
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|s| crate::config::SkillInput {
+                    id: s.id.clone(),
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                    tags: s.tags.clone().unwrap_or_default(),
+                })
+                .collect(),
             agent_card_security_schemes_json: c.agent_card_security_schemes_json.clone(),
             agent_card_override_json: c.agent_card_override_json.clone(),
+
+            publish_agent_card_to_exchange: c.publish_agent_card_to_exchange,
+            anypoint_client_id: c.anypoint_client_id.clone(),
+            anypoint_client_secret: c.anypoint_client_secret.clone(),
+            anypoint_org_id: c.anypoint_org_id.clone(),
+            exchange_asset_group_id: c.exchange_asset_group_id.clone(),
+            exchange_asset_id: c.exchange_asset_id.clone(),
 
             diagnostic_pre_body_probe: c.diagnostic_pre_body_probe,
             diagnostic_pre_body_agentforce_probe: c.diagnostic_pre_body_agentforce_probe,
@@ -185,6 +193,19 @@ struct PolicyState {
     /// `auth.get_token` from the `RequestHeaders` state. Outside of the
     /// diagnostic path, `auth` is owned by `dispatcher` already.
     auth: Rc<AgentforceAuth>,
+
+    /// Shared cache used by the Exchange-publish OAuth path.
+    cache: Rc<dyn Cache>,
+    /// Service for the Anypoint OAuth token endpoint. Only present when
+    /// codegen registered a Service (i.e. operator left the default).
+    anypoint_token_service: Option<Rc<Service>>,
+    /// Service for `exchangeBaseUrl`. Same caveat as above.
+    exchange_service: Option<Rc<Service>>,
+    /// Authority of the token URL (used as cache-key salt).
+    anypoint_token_authority: String,
+    /// Fire-once flag: the publish runs at most once per replica, on the
+    /// first inbound request after `configure()`. Per-replica, in-memory.
+    publish_done: Rc<std::cell::Cell<bool>>,
 }
 
 /// User data carried from the request phase to the response phase.
@@ -220,6 +241,12 @@ async fn request_filter(
         state.cfg.a2a_rpc_path,
         route
     );
+
+    // Fire-once Exchange asset publish on the first request to land on
+    // each replica. Outbound HTTP is safe in this context (request-headers
+    // phase, before the body-state transition). Best-effort: any failure
+    // logs at warn and the request continues normally.
+    maybe_publish_agent_card(&state, &client).await;
 
     match route {
         Route::AgentCard => match state.card.bytes(&client, now_unix()).await {
@@ -393,6 +420,70 @@ async fn response_filter(
     }
 }
 
+/// Fire-once Exchange asset publish. Runs at most once per replica, on
+/// the first inbound request after `configure()`. Best-effort: any
+/// failure (transport, auth, validation) logs at warn and is swallowed.
+async fn maybe_publish_agent_card(state: &PolicyState, client: &HttpClient) {
+    if state.publish_done.get() {
+        return;
+    }
+    let publish_cfg = match state.cfg.exchange_publish.as_ref() {
+        Some(c) => c,
+        None => {
+            // Toggle off (or required fields blank): never try, and don't
+            // keep checking on every request.
+            state.publish_done.set(true);
+            return;
+        }
+    };
+    let token_svc = match state.anypoint_token_service.as_ref() {
+        Some(s) => s,
+        None => {
+            logger::warn!(
+                "exchange-publish: publishAgentCardToExchange=true but anypointTokenUrl Service is not registered; skipping"
+            );
+            state.publish_done.set(true);
+            return;
+        }
+    };
+    let exch = match state.exchange_service.as_ref() {
+        Some(s) => s,
+        None => {
+            logger::warn!(
+                "exchange-publish: publishAgentCardToExchange=true but exchangeBaseUrl Service is not registered; skipping"
+            );
+            state.publish_done.set(true);
+            return;
+        }
+    };
+    let card_bytes = match state.card.warmed_bytes() {
+        Some(b) => b,
+        None => {
+            // URL-source card; not yet resolved. Try again on a later
+            // request once the card has been fetched.
+            return;
+        }
+    };
+
+    state.publish_done.set(true);
+    let ctx = exchange::publish::PublishContext {
+        cfg: state.cfg.as_ref(),
+        publish_cfg,
+        cache: state.cache.as_ref(),
+        anypoint_token_service: token_svc.as_ref(),
+        exchange_service: exch.as_ref(),
+        anypoint_token_authority: &state.anypoint_token_authority,
+        now_unix: now_unix(),
+    };
+    if let Err(e) =
+        exchange::publish::publish_agent_card(client, ctx, card_bytes.as_slice()).await
+    {
+        logger::warn!(
+            "exchange-publish: failed to publish agent-card: {e}; policy continues"
+        );
+    }
+}
+
 fn make_json_response(status: u32, body: &[u8]) -> Response {
     Response::new(status)
         .with_headers(vec![(
@@ -421,21 +512,27 @@ pub async fn configure(
         my_domain_url,
         agentforce_api_url,
         agentforce_api_base_path: cfg_base_path,
-        object_store_base_url,
-        anypoint_token_url,
         agent_card_url,
+        anypoint_token_url,
+        exchange_base_url,
         ..
     } = raw;
     let my_domain_service = Rc::new(my_domain_url);
     let agentforce_api_service = Rc::new(agentforce_api_url);
-    let object_store_service = Rc::new(object_store_base_url);
-    let anypoint_token_service = Rc::new(anypoint_token_url);
     let agent_card_url_service = agent_card_url.map(Rc::new);
+    let anypoint_token_service = anypoint_token_url.map(Rc::new);
+    let exchange_service = exchange_base_url.map(Rc::new);
+    // Cache-key salt for the Exchange OAuth token. Falls back to a fixed
+    // string if no token Service is registered (publish will be skipped
+    // anyway, so this is just to keep types straight).
+    let anypoint_token_authority = anypoint_token_service
+        .as_ref()
+        .map(|s| s.uri().authority().to_string())
+        .unwrap_or_default();
 
     let my_domain_authority = my_domain_service.uri().authority().to_string();
     let my_domain_scheme = my_domain_service.uri().scheme().to_string();
     let my_domain_url_value = format!("{my_domain_scheme}://{my_domain_authority}");
-    let anypoint_token_authority = anypoint_token_service.uri().authority().to_string();
 
     // Prefer the explicit `agentforceApiBasePath` config field (the
     // host-only registered Service is friendlier to connected-mode
@@ -471,27 +568,8 @@ pub async fn configure(
         cfg.bypass_user,
     ));
 
-    let os2 = Rc::new(ObjectStoreV2::new(
-        OS2Config {
-            anypoint_client_id: cfg.anypoint_client_id.clone(),
-            anypoint_client_secret: cfg.anypoint_client_secret.clone(),
-            anypoint_org_id: cfg.anypoint_org_id.clone(),
-            anypoint_env_id: cfg.anypoint_env_id.clone(),
-            object_store_id: cfg.object_store_id.clone(),
-            anypoint_token_url_for_cache_key: anypoint_token_authority.clone(),
-            cache_safety_margin_seconds: cfg.cache_safety_margin_seconds,
-            timeout_ms: cfg.task_store_timeout_ms,
-            auto_create_store: cfg.auto_create_store,
-            disable_object_store: cfg.disable_object_store,
-            object_store_ttl_seconds: cfg.object_store_ttl_seconds,
-        },
-        cache.clone(),
-        anypoint_token_service.clone(),
-        object_store_service.clone(),
-    ));
     let task_store = Rc::new(TaskStore::new(
         cache.clone(),
-        os2.clone(),
         cfg.task_hot_cache_ttl_seconds,
     ));
 
@@ -509,11 +587,25 @@ pub async fn configure(
         return Err(anyhow!("agent card configuration rejected: {e}"));
     }
 
+    // Best-effort validation: if the operator turned on the publish
+    // toggle but didn't fill in the required fields, log a clear reason
+    // here. The publish itself is deferred to the first request.
+    if raw.publish_agent_card_to_exchange.unwrap_or(false) && cfg.exchange_publish.is_none() {
+        logger::warn!(
+            "exchange-publish: publishAgentCardToExchange=true but anypointClientId / anypointClientSecret / anypointOrgId / exchangeAssetId is missing; skipping publish (policy continues)"
+        );
+    }
+
     let state = PolicyState {
         cfg: cfg.clone(),
         card,
         dispatcher,
         auth: auth.clone(),
+        cache: cache.clone(),
+        anypoint_token_service,
+        exchange_service,
+        anypoint_token_authority,
+        publish_done: Rc::new(std::cell::Cell::new(false)),
     };
 
     let request_state = state.clone();

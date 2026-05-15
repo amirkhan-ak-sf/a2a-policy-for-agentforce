@@ -27,15 +27,6 @@ pub enum ConfigError {
     #[error("agentId is required")]
     MissingAgentId,
 
-    #[error("anypointOrgId is required")]
-    MissingAnypointOrgId,
-
-    #[error("anypointEnvId is required")]
-    MissingAnypointEnvId,
-
-    #[error("objectStoreId is required")]
-    MissingObjectStoreId,
-
     #[error(
         "agentCardSource is 'inline_json' or 'file' but agentCardJson is empty"
     )]
@@ -44,8 +35,8 @@ pub enum ConfigError {
     #[error("agentCardSource is 'url' but no agentCardUrl Service is registered")]
     AgentCardUrlNotRegistered,
 
-    #[error("agentCardSkillsJson must be a JSON array")]
-    AgentCardSkillsNotArray,
+    #[error("agentCardSkills entry is missing required field '{0}'")]
+    AgentCardSkillEmptyField(&'static str),
 
     #[error(
         "agentCardSecuritySchemesJson must be a JSON object"
@@ -108,6 +99,31 @@ impl AgentCardSource {
     }
 }
 
+/// Resolved Exchange-publish settings. Only present when
+/// `publishAgentCardToExchange = true` AND the required fields are set.
+/// If the toggle is on but credentials/asset id are missing, this stays
+/// `None` and the policy logs a warn at first request — never blocks
+/// policy load.
+#[derive(Debug, Clone)]
+pub struct ExchangePublishConfig {
+    pub anypoint_client_id: String,
+    pub anypoint_client_secret: String,
+    pub anypoint_org_id: String,
+    pub group_id: String,
+    pub asset_id: String,
+}
+
+/// One row of the `agentCardSkills` array as supplied by the operator.
+/// Decoupled from the codegen-generated struct so unit tests don't need
+/// the PDK runtime.
+#[derive(Debug, Clone)]
+pub struct SkillInput {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub tags: Vec<String>,
+}
+
 /// Structured (form-field) snapshot of the AgentCard. Empty/None values are
 /// not added to the resulting JSON object so they don't override good
 /// defaults coming from a deep-merge.
@@ -144,23 +160,17 @@ pub struct PolicyConfig {
     pub public_base_url: String,
     pub strict_mode: bool,
 
-    // OS v2
-    pub anypoint_client_id: String,
-    pub anypoint_client_secret: String,
-    pub anypoint_org_id: String,
-    pub anypoint_env_id: String,
-    pub object_store_id: String,
-    pub auto_create_store: bool,
-    pub disable_object_store: bool,
-    pub object_store_ttl_seconds: u32,
+    // Task cache (per-replica, in-memory)
     pub task_hot_cache_ttl_seconds: u32,
-    pub task_store_timeout_ms: u64,
 
     // Agent card
     pub agent_card_source: AgentCardSource,
     pub agent_card_json: Option<String>,
     pub structured_card: StructuredCardConfig,
     pub agent_card_override: Option<serde_json::Value>,
+
+    // Exchange publish: Some when toggle is on AND required fields are set.
+    pub exchange_publish: Option<ExchangePublishConfig>,
 
     // Diagnostic flags. Used to A/B test the connected-mode WASM trap
     // hypothesis. Both default to false in production.
@@ -187,16 +197,7 @@ pub struct RawConfig {
     pub public_base_url: Option<String>,
     pub strict_mode: Option<bool>,
 
-    pub anypoint_client_id: Option<String>,
-    pub anypoint_client_secret: Option<String>,
-    pub anypoint_org_id: Option<String>,
-    pub anypoint_env_id: Option<String>,
-    pub object_store_id: Option<String>,
-    pub auto_create_store: Option<bool>,
-    pub disable_object_store: Option<bool>,
-    pub object_store_ttl_seconds: Option<i64>,
     pub task_hot_cache_ttl_seconds: Option<i64>,
-    pub task_store_timeout_ms: Option<i64>,
 
     pub agent_card_source: Option<String>,
     pub agent_card_json: Option<String>,
@@ -216,9 +217,16 @@ pub struct RawConfig {
     pub agent_card_capabilities_push_notifications: Option<bool>,
     pub agent_card_default_input_modes: Option<String>,
     pub agent_card_default_output_modes: Option<String>,
-    pub agent_card_skills_json: Option<String>,
+    pub agent_card_skills: Vec<SkillInput>,
     pub agent_card_security_schemes_json: Option<String>,
     pub agent_card_override_json: Option<String>,
+
+    pub publish_agent_card_to_exchange: Option<bool>,
+    pub anypoint_client_id: Option<String>,
+    pub anypoint_client_secret: Option<String>,
+    pub anypoint_org_id: Option<String>,
+    pub exchange_asset_group_id: Option<String>,
+    pub exchange_asset_id: Option<String>,
 
     pub diagnostic_pre_body_probe: Option<bool>,
     pub diagnostic_pre_body_agentforce_probe: Option<bool>,
@@ -240,19 +248,6 @@ impl PolicyConfig {
         let public_base_url =
             nonempty(raw.public_base_url.clone(), ConfigError::MissingPublicBaseUrl)?;
 
-        let anypoint_client_id = raw.anypoint_client_id.clone().unwrap_or_default();
-        let anypoint_client_secret = raw.anypoint_client_secret.clone().unwrap_or_default();
-        let anypoint_org_id =
-            nonempty(raw.anypoint_org_id.clone(), ConfigError::MissingAnypointOrgId)?;
-        let anypoint_env_id =
-            nonempty(raw.anypoint_env_id.clone(), ConfigError::MissingAnypointEnvId)?;
-        let object_store_id =
-            nonempty(raw.object_store_id.clone(), ConfigError::MissingObjectStoreId)?;
-        let auto_create_store = raw.auto_create_store.unwrap_or(true);
-        let disable_object_store = raw.disable_object_store.unwrap_or(false);
-        let object_store_ttl_seconds =
-            clamp_u32(raw.object_store_ttl_seconds, 60, 2_592_000, 86_400);
-
         let protocol_version =
             ProtocolVersion::parse(raw.protocol_version.as_deref().unwrap_or("0.3.0"))?;
         let agent_card_source =
@@ -263,8 +258,6 @@ impl PolicyConfig {
         let bypass_user = raw.bypass_user.unwrap_or(true);
         let cache_safety_margin_seconds = clamp_u32(raw.cache_safety_margin_seconds, 0, 600, 60);
         let task_hot_cache_ttl_seconds = clamp_u32(raw.task_hot_cache_ttl_seconds, 0, 3600, 60);
-        let task_store_timeout_ms =
-            clamp_u32(raw.task_store_timeout_ms, 100, 30_000, 1_500) as u64;
 
         // Validate the source-specific inputs and parse the structured card
         // payload regardless of source so a misconfigured field surfaces at
@@ -302,6 +295,33 @@ impl PolicyConfig {
             ConfigError::AgentCardOverrideNotObject,
         )?;
 
+        // Best-effort resolution of the Exchange-publish settings. If the
+        // operator turned on the toggle but didn't fill in the required
+        // fields, we log at warn (in lib.rs) and skip the publish — never
+        // refuse policy load. Refusing would fault every request.
+        let exchange_publish = if raw.publish_agent_card_to_exchange.unwrap_or(false) {
+            let cid = nonempty_opt(raw.anypoint_client_id.clone());
+            let csec = nonempty_opt(raw.anypoint_client_secret.clone());
+            let org = nonempty_opt(raw.anypoint_org_id.clone());
+            let asset_id = nonempty_opt(raw.exchange_asset_id.clone());
+            match (cid, csec, org, asset_id) {
+                (Some(cid), Some(csec), Some(org), Some(asset_id)) => {
+                    let group_id = nonempty_opt(raw.exchange_asset_group_id.clone())
+                        .unwrap_or_else(|| org.clone());
+                    Some(ExchangePublishConfig {
+                        anypoint_client_id: cid,
+                        anypoint_client_secret: csec,
+                        anypoint_org_id: org,
+                        group_id,
+                        asset_id,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             consumer_key,
             consumer_secret,
@@ -315,21 +335,14 @@ impl PolicyConfig {
             public_base_url,
             strict_mode,
 
-            anypoint_client_id,
-            anypoint_client_secret,
-            anypoint_org_id,
-            anypoint_env_id,
-            object_store_id,
-            auto_create_store,
-            disable_object_store,
-            object_store_ttl_seconds,
             task_hot_cache_ttl_seconds,
-            task_store_timeout_ms,
 
             agent_card_source,
             agent_card_json,
             structured_card,
             agent_card_override,
+
+            exchange_publish,
 
             diagnostic_pre_body_probe: raw.diagnostic_pre_body_probe.unwrap_or(false),
             diagnostic_pre_body_agentforce_probe: raw
@@ -341,20 +354,25 @@ impl PolicyConfig {
 }
 
 fn parse_structured(raw: &RawConfig) -> Result<StructuredCardConfig, ConfigError> {
-    let skills_str = raw
-        .agent_card_skills_json
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("[]");
-    let skills: serde_json::Value =
-        serde_json::from_str(skills_str).map_err(|e| ConfigError::InvalidJson {
-            field: "agentCardSkillsJson",
-            error: e.to_string(),
-        })?;
-    if !skills.is_array() {
-        return Err(ConfigError::AgentCardSkillsNotArray);
+    let mut skill_values: Vec<serde_json::Value> = Vec::with_capacity(raw.agent_card_skills.len());
+    for skill in &raw.agent_card_skills {
+        if skill.id.trim().is_empty() {
+            return Err(ConfigError::AgentCardSkillEmptyField("id"));
+        }
+        if skill.name.trim().is_empty() {
+            return Err(ConfigError::AgentCardSkillEmptyField("name"));
+        }
+        if skill.description.trim().is_empty() {
+            return Err(ConfigError::AgentCardSkillEmptyField("description"));
+        }
+        skill_values.push(serde_json::json!({
+            "id": skill.id,
+            "name": skill.name,
+            "description": skill.description,
+            "tags": skill.tags,
+        }));
     }
+    let skills = serde_json::Value::Array(skill_values);
 
     let security_schemes = parse_optional_object(
         raw.agent_card_security_schemes_json.as_deref(),
@@ -480,9 +498,6 @@ mod tests {
             consumer_secret: Some("client-secret".into()),
             agent_id: Some("0XXxx0000000000".into()),
             public_base_url: Some("https://gw.example.com/a2a".into()),
-            anypoint_org_id: Some("org-1".into()),
-            anypoint_env_id: Some("env-1".into()),
-            object_store_id: Some("a2a-tasks".into()),
             agent_card_source: Some("structured".into()),
             agent_card_name: Some("Test Agent".into()),
             agent_card_description: Some("desc".into()),
@@ -499,7 +514,6 @@ mod tests {
         assert!(cfg.bypass_user);
         assert_eq!(cfg.cache_safety_margin_seconds, 60);
         assert_eq!(cfg.task_hot_cache_ttl_seconds, 60);
-        assert_eq!(cfg.task_store_timeout_ms, 1500);
         assert_eq!(cfg.agent_card_source, AgentCardSource::Structured);
         assert_eq!(cfg.structured_card.default_input_modes, vec!["text/plain"]);
     }
@@ -568,21 +582,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_skills_when_not_array() {
+    fn rejects_skill_with_blank_id() {
         let mut raw = minimal();
-        raw.agent_card_skills_json = Some("{}".into());
+        raw.agent_card_skills = vec![SkillInput {
+            id: "  ".into(),
+            name: "Greet".into(),
+            description: "d".into(),
+            tags: vec!["t".into()],
+        }];
         assert!(matches!(
             PolicyConfig::from_raw(raw),
-            Err(ConfigError::AgentCardSkillsNotArray)
+            Err(ConfigError::AgentCardSkillEmptyField("id"))
         ));
     }
 
     #[test]
-    fn rejects_invalid_skills_json() {
+    fn rejects_skill_with_blank_name() {
         let mut raw = minimal();
-        raw.agent_card_skills_json = Some("not-json".into());
-        let err = PolicyConfig::from_raw(raw).unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidJson { field: "agentCardSkillsJson", .. }));
+        raw.agent_card_skills = vec![SkillInput {
+            id: "s1".into(),
+            name: "".into(),
+            description: "d".into(),
+            tags: vec![],
+        }];
+        assert!(matches!(
+            PolicyConfig::from_raw(raw),
+            Err(ConfigError::AgentCardSkillEmptyField("name"))
+        ));
     }
 
     #[test]
@@ -590,8 +616,12 @@ mod tests {
         let mut raw = minimal();
         raw.agent_card_capabilities_streaming = Some(true);
         raw.agent_card_default_input_modes = Some("text/plain, application/json".into());
-        raw.agent_card_skills_json =
-            Some(r#"[{"id":"s1","name":"Greet","description":"d","tags":["t"]}]"#.into());
+        raw.agent_card_skills = vec![SkillInput {
+            id: "s1".into(),
+            name: "Greet".into(),
+            description: "d".into(),
+            tags: vec!["t".into()],
+        }];
         let cfg = PolicyConfig::from_raw(raw).unwrap();
         assert!(cfg.structured_card.capabilities_streaming);
         assert_eq!(
@@ -599,6 +629,8 @@ mod tests {
             vec!["text/plain".to_string(), "application/json".to_string()]
         );
         assert!(cfg.structured_card.skills.is_array());
+        assert_eq!(cfg.structured_card.skills[0]["id"], "s1");
+        assert_eq!(cfg.structured_card.skills[0]["tags"][0], "t");
     }
 
     #[test]

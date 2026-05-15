@@ -118,90 +118,21 @@ spec:
         404. When false, non-A2A requests are forwarded to the upstream.
 
     # ---------------------------------------------------------------------
-    # Anypoint Object Store v2: persistent task store
+    # Task state cache (per-replica, in-memory)
     # ---------------------------------------------------------------------
-    objectStoreBaseUrl:
-      type: string
-      format: service
-      description: |
-        Region-scoped Anypoint Object Store v2 host, e.g.
-        https://object-store-us-east-1.anypoint.mulesoft.com. Registered
-        as an Envoy upstream cluster.
-    anypointTokenUrl:
-      type: string
-      format: service
-      default: https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token
-      description: |
-        Anypoint platform OAuth token endpoint used to mint a bearer for
-        Object Store v2 calls (separate from Salesforce credentials).
-    anypointClientId:
-      type: string
-      description: |
-        Anypoint connected-app client_id with the
-        'Use Object Store with the connected app' scope.
-    anypointClientSecret:
-      type: string
-      format: password
-      description: Anypoint connected-app client_secret.
-    anypointOrgId:
-      type: string
-      description: UUID of the Anypoint organization that owns the Object Store.
-    anypointEnvId:
-      type: string
-      description: UUID of the Anypoint environment that owns the Object Store.
-    objectStoreId:
-      type: string
-      description: |
-        Name of the Anypoint Object Store v2 store. If autoCreateStore is
-        true (the default) and the store does not exist, the policy will
-        create it on the first persistence call using objectStoreTtlSeconds.
-        The connected app supplied via anypointClientId must have admin
-        access to OS v2 in that case. If autoCreateStore is false, the
-        store must already exist.
-    autoCreateStore:
-      type: boolean
-      default: true
-      description: |
-        When true, the policy creates the OS v2 store on first use if it
-        does not yet exist. The connected app must have OS v2 admin access.
-        Set to false to require operators to pre-create the store via
-        Runtime Manager or the Anypoint CLI.
-    disableObjectStore:
-      type: boolean
-      default: false
-      description: |
-        When true, the policy skips Anypoint Object Store v2 entirely and
-        keeps task state only in the per-replica in-memory hot cache.
-        Useful as an escape hatch when the OS v2 upstream is degraded;
-        tasks become per-replica and disappear on policy reload, but the
-        rest of the A2A surface keeps working. Leave false for production.
-    objectStoreTtlSeconds:
-      type: integer
-      minimum: 60
-      maximum: 2592000
-      default: 86400
-      description: |
-        TTL (seconds) applied when the policy creates the OS v2 store
-        (autoCreateStore true). Defaults to 24h. Ignored when the store
-        already exists; OS v2 does not let policies retroactively change
-        the TTL of an existing store.
+    # OS v2 persistence has been removed for now — task state lives only
+    # in the per-replica PDK in-memory cache. tasks/get for a task that
+    # landed on a different replica or aged past the TTL returns
+    # "Task not found".
     taskHotCacheTtlSeconds:
       type: integer
       minimum: 0
       maximum: 3600
       default: 60
       description: |
-        TTL (seconds) of the per-replica PDK in-memory cache that fronts
-        Object Store v2. Acts as a latency optimizer; OS v2 is the
-        source of truth.
-    taskStoreTimeoutMs:
-      type: integer
-      minimum: 100
-      maximum: 30000
-      default: 1500
-      description: |
-        Per-call timeout for OS v2 reads/writes. On timeout, reads return
-        'not found' and writes log a warning; the RPC still succeeds.
+        TTL (seconds) for the per-replica PDK in-memory task cache. Tasks
+        younger than this are returned by tasks/get on the replica that
+        served message/send; older tasks are reported as not found.
 
     # ---------------------------------------------------------------------
     # Agent card configuration. Operator picks one of four sources and
@@ -293,13 +224,41 @@ spec:
       description: |
         Comma-separated AgentCard.defaultOutputModes (structured mode).
         Defaults to 'text/plain'.
-    agentCardSkillsJson:
-      type: string
-      default: "[]"
+    agentCardSkills:
+      type: array
+      default: []
       description: |
-        JSON array of A2A AgentSkill objects (structured mode). Each
-        skill must include id, name, description, and tags. Validated
-        at policy load time.
+        AgentCard.skills (structured mode). Click "Add" to add a skill
+        and fill in id, name, description, and tags. Each row is emitted
+        as one object in the `skills` array of the agent-card.json
+        served at `/.well-known/agent-card.json`.
+      items:
+        type: object
+        required:
+          - id
+          - name
+          - description
+        properties:
+          id:
+            type: string
+            description: |
+              Stable identifier for the skill (e.g. `inventory-check`).
+          name:
+            type: string
+            description: Human-readable skill name (e.g. "Inventory check").
+          description:
+            type: string
+            description: |
+              Short sentence describing what the skill does (e.g.
+              "Ask about MULETEST product availability").
+          tags:
+            type: array
+            default: []
+            description: |
+              Free-form tags for grouping skills (e.g.
+              ["agentforce", "inventory"]). Optional.
+            items:
+              type: string
     agentCardSecuritySchemesJson:
       type: string
       default: ""
@@ -314,6 +273,73 @@ spec:
         agent card resolved from the chosen source. Useful for
         overriding a single field (e.g. extra securitySchemes) without
         rewriting the whole card.
+
+    # ---------------------------------------------------------------------
+    # Anypoint Exchange asset publication (opt-in)
+    # ---------------------------------------------------------------------
+    # When enabled, the resolved agent-card.json is published as a new
+    # version of an existing Exchange `agent` asset on the first request
+    # that lands on each replica after policy load. Failures log at warn
+    # and never block traffic. See docs/operator-runbook for setup.
+    publishAgentCardToExchange:
+      type: boolean
+      default: false
+      description: |
+        When true, the policy POSTs the resolved agent-card.json to the
+        Exchange asset identified by `exchangeAssetGroupId` /
+        `exchangeAssetId` on the first inbound request after policy load.
+        The version published is `<agentCardVersion>-<sha256-prefix>` so
+        re-applying the same config is idempotent (Exchange returns 409
+        on a repeat and the policy treats it as success).
+    exchangeBaseUrl:
+      type: string
+      format: service
+      default: https://anypoint.mulesoft.com
+      description: |
+        Anypoint Exchange host. Registered as an Envoy upstream cluster.
+        Override only for EU / sovereign cloud or air-gapped tenants.
+    anypointTokenUrl:
+      type: string
+      format: service
+      default: https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token
+      description: |
+        Anypoint platform OAuth token endpoint used to mint the bearer
+        for the Exchange publish call.
+    anypointClientId:
+      type: string
+      default: ""
+      description: |
+        Connected-app client_id with the `Exchange Contributor` role on
+        the target asset. Required when `publishAgentCardToExchange` is
+        true.
+    anypointClientSecret:
+      type: string
+      format: password
+      default: ""
+      description: |
+        Connected-app client_secret matching `anypointClientId`. Required
+        when `publishAgentCardToExchange` is true.
+    anypointOrgId:
+      type: string
+      default: ""
+      description: |
+        UUID of the Anypoint organization that owns the Exchange asset.
+        Required when `publishAgentCardToExchange` is true.
+    exchangeAssetGroupId:
+      type: string
+      default: ""
+      description: |
+        groupId of the existing Exchange agent asset. Leave blank to use
+        `anypointOrgId` (Exchange uses the org UUID as the groupId for
+        org-private assets, the common case).
+    exchangeAssetId:
+      type: string
+      default: ""
+      description: |
+        assetId of the existing Exchange `agent` asset (e.g.
+        "sales-order-mgmt"). The asset must already exist; the policy
+        adds a new version per apply. Required when
+        `publishAgentCardToExchange` is true.
 
     diagnosticPreBodyProbe:
       type: boolean
@@ -353,10 +379,3 @@ spec:
     - consumerSecret
     - agentId
     - publicBaseUrl
-    - objectStoreBaseUrl
-    - anypointTokenUrl
-    - anypointClientId
-    - anypointClientSecret
-    - anypointOrgId
-    - anypointEnvId
-    - objectStoreId

@@ -1,27 +1,23 @@
-//! Read-through / write-through task store.
+//! In-memory (per-replica) task store.
 //!
-//! The PDK shared cache acts as a per-replica latency layer in front of
-//! Anypoint Object Store v2. OS v2 is the persistent source of truth; the
-//! hot cache only avoids repeat round-trips for follow-on requests landing
-//! on the same replica within `taskHotCacheTtlSeconds`.
+//! OS v2 persistence has been removed for now. The PDK shared cache
+//! is the only backing layer; tasks live for `taskHotCacheTtlSeconds`
+//! and disappear on policy reload or replica replacement.
 //!
 //! Two values are stored per task:
 //!
 //!   * `task:<taskId>`     - full A2A `Task` JSON.
 //!   * `meta:<taskId>`     - small `{ sequenceId, lastUpdatedAt }` JSON.
 //!
-//! The hot cache and OS v2 share the same key string. Hot-cache TTL is not
-//! enforced by the PDK cache (which is FIFO with a fixed capacity), so we
-//! piggy-back on a small `expires_at_unix` envelope.
+//! Hot-cache TTL is not enforced by the PDK cache (which is FIFO with a
+//! fixed capacity), so we piggy-back on a small `expires_at_unix`
+//! envelope.
 
 use std::rc::Rc;
 
 use pdk::cache::Cache;
 use pdk::hl::HttpClient;
-use pdk::logger;
 use serde::{Deserialize, Serialize};
-
-use crate::store::object_store_v2::{GetOutcome, ObjectStoreV2};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HotEnvelope {
@@ -52,15 +48,13 @@ impl TaskMeta {
 
 pub struct TaskStore {
     hot: Rc<dyn Cache>,
-    os2: Rc<ObjectStoreV2>,
     hot_ttl_seconds: u32,
 }
 
 impl TaskStore {
-    pub fn new(hot: Rc<dyn Cache>, os2: Rc<ObjectStoreV2>, hot_ttl_seconds: u32) -> Self {
+    pub fn new(hot: Rc<dyn Cache>, hot_ttl_seconds: u32) -> Self {
         Self {
             hot,
-            os2,
             hot_ttl_seconds,
         }
     }
@@ -93,102 +87,65 @@ impl TaskStore {
         }
     }
 
-    /// Get the full Task JSON. Returns `None` if not found anywhere; OS v2
-    /// outages are treated as "not found".
+    /// Get the full Task JSON. Returns `None` if not in the hot cache or
+    /// the entry has expired. The `_client` parameter is unused now that
+    /// OS v2 has been removed; kept on the signature so call-sites don't
+    /// have to change while we iterate.
     pub async fn get_task(
         &self,
-        client: &HttpClient,
+        _client: &HttpClient,
         task_id: &str,
         now_unix: u64,
     ) -> Option<Vec<u8>> {
         let key = Self::task_key(task_id);
-        logger::error!("a2a-trace: task-store get_task key='{key}'");
-        if let Some(b) = self.read_hot(&key, now_unix) {
-            logger::error!("a2a-trace: task-store hot hit for {task_id}");
-            return Some(b);
-        }
-        logger::error!("a2a-trace: task-store calling os2.get");
-        match self.os2.get(client, &key, now_unix).await {
-            GetOutcome::Found(bytes) => {
-                logger::error!("a2a-trace: task-store os2 found, len={}", bytes.len());
-                self.write_hot(&key, &bytes, now_unix);
-                Some(bytes)
-            }
-            GetOutcome::NotFound => {
-                logger::error!("a2a-trace: task-store os2 not found");
-                None
-            }
-            GetOutcome::Degraded => {
-                logger::error!("a2a-trace: task-store os2 degraded");
-                None
-            }
-        }
+        self.read_hot(&key, now_unix)
     }
 
-    /// Persist the full Task JSON. Hot cache is updated synchronously; OS
-    /// v2 PUT is best-effort.
+    /// Persist the full Task JSON to the hot cache.
     pub async fn put_task(
         &self,
-        client: &HttpClient,
+        _client: &HttpClient,
         task_id: &str,
         task_json: &[u8],
         now_unix: u64,
     ) {
         let key = Self::task_key(task_id);
         self.write_hot(&key, task_json, now_unix);
-        self.os2.put(client, &key, task_json, now_unix).await;
     }
 
-    /// Drop the task from both layers. Reserved for a future tasks/expire
-    /// flow; v1 keeps canceled tasks (with `state = canceled`) so clients
-    /// can retrieve the last known status.
+    /// Drop the task from the hot cache. Reserved for a future
+    /// tasks/expire flow; v1 keeps canceled tasks (with `state = canceled`)
+    /// so clients can retrieve the last known status.
     #[allow(dead_code)]
     pub async fn delete_task(
         &self,
-        client: &HttpClient,
+        _client: &HttpClient,
         task_id: &str,
-        now_unix: u64,
+        _now_unix: u64,
     ) {
         let key = Self::task_key(task_id);
         self.hot.delete(&key);
-        self.os2.delete(client, &key, now_unix).await;
         let mkey = Self::meta_key(task_id);
         self.hot.delete(&mkey);
-        self.os2.delete(client, &mkey, now_unix).await;
     }
 
     /// Read the meta sidecar (sequence counter). Missing => return `None`
     /// so the caller starts a fresh sequence.
     pub async fn get_meta(
         &self,
-        client: &HttpClient,
+        _client: &HttpClient,
         task_id: &str,
         now_unix: u64,
     ) -> Option<TaskMeta> {
         let key = Self::meta_key(task_id);
-        if let Some(bytes) = self.read_hot(&key, now_unix) {
-            if let Ok(m) = serde_json::from_slice::<TaskMeta>(&bytes) {
-                return Some(m);
-            }
-        }
-        match self.os2.get(client, &key, now_unix).await {
-            GetOutcome::Found(bytes) => {
-                let parsed: Option<TaskMeta> = serde_json::from_slice(&bytes).ok();
-                if let Some(ref m) = parsed {
-                    if let Ok(b) = serde_json::to_vec(m) {
-                        self.write_hot(&key, &b, now_unix);
-                    }
-                }
-                parsed
-            }
-            GetOutcome::NotFound | GetOutcome::Degraded => None,
-        }
+        let bytes = self.read_hot(&key, now_unix)?;
+        serde_json::from_slice::<TaskMeta>(&bytes).ok()
     }
 
-    /// Persist the meta sidecar. Hot cache + best-effort OS v2 PUT.
+    /// Persist the meta sidecar to the hot cache.
     pub async fn put_meta(
         &self,
-        client: &HttpClient,
+        _client: &HttpClient,
         task_id: &str,
         meta: &TaskMeta,
         now_unix: u64,
@@ -199,7 +156,6 @@ impl TaskStore {
             Err(_) => return,
         };
         self.write_hot(&key, &bytes, now_unix);
-        self.os2.put(client, &key, &bytes, now_unix).await;
     }
 }
 
